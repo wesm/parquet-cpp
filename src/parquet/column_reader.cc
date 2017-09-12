@@ -252,6 +252,58 @@ int64_t ColumnReader::ReadRepetitionLevels(int64_t batch_size, int16_t* levels) 
   return repetition_level_decoder_.Decode(static_cast<int>(batch_size), levels);
 }
 
+namespace internal {
+
+void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
+                              int16_t max_definition_level,
+                              int16_t max_repetition_level, int64_t* values_read,
+                              int64_t* null_count, uint8_t* valid_bits,
+                              int64_t valid_bits_offset) {
+  int byte_offset = static_cast<int>(valid_bits_offset) / 8;
+  int bit_offset = static_cast<int>(valid_bits_offset) % 8;
+  uint8_t bitset = valid_bits[byte_offset];
+
+  // TODO(itaiin): As an interim solution we are splitting the code path here
+  // between repeated+flat column reads, and non-repeated+nested reads.
+  // Those paths need to be merged in the future
+  for (int i = 0; i < num_def_levels; ++i) {
+    if (def_levels[i] == max_definition_level) {
+      bitset |= (1 << bit_offset);
+    } else if (max_repetition_level > 0) {
+      // repetition+flat case
+      if (def_levels[i] == (max_definition_level - 1)) {
+        bitset &= ~(1 << bit_offset);
+        *null_count += 1;
+      } else {
+        continue;
+      }
+    } else {
+      // non-repeated+nested case
+      if (def_levels[i] < max_definition_level) {
+        bitset &= ~(1 << bit_offset);
+        *null_count += 1;
+      } else {
+        throw ParquetException("definition level exceeds maximum");
+      }
+    }
+
+    bit_offset++;
+    if (bit_offset == 8) {
+      bit_offset = 0;
+      valid_bits[byte_offset] = bitset;
+      byte_offset++;
+      // TODO: Except for the last byte, this shouldn't be needed
+      bitset = valid_bits[byte_offset];
+    }
+  }
+  if (bit_offset != 0) {
+    valid_bits[byte_offset] = bitset;
+  }
+  *values_read = (bit_offset + byte_offset * 8 - valid_bits_offset);
+}
+
+}  // namespace internal
+
 // ----------------------------------------------------------------------
 // Dynamic column reader constructor
 
@@ -280,6 +332,199 @@ std::shared_ptr<ColumnReader> ColumnReader::Make(const ColumnDescriptor* descr,
   }
   // Unreachable code, but supress compiler warning
   return std::shared_ptr<ColumnReader>(nullptr);
+}
+
+// ----------------------------------------------------------------------
+// Type column reader implementations
+
+template <typename DType>
+int64_t TypedColumnReader<DType>::ReadValues(int64_t batch_size, T* out) {
+  int64_t num_decoded = current_decoder_->Decode(out, static_cast<int>(batch_size));
+  return num_decoded;
+}
+
+template <typename DType>
+int64_t TypedColumnReader<DType>::ReadValuesSpaced(int64_t batch_size, T* out,
+                                                          int null_count,
+                                                          uint8_t* valid_bits,
+                                                          int64_t valid_bits_offset) {
+  return current_decoder_->DecodeSpaced(out, static_cast<int>(batch_size), null_count,
+                                        valid_bits, valid_bits_offset);
+}
+
+template <typename DType>
+int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size,
+                                                   int16_t* def_levels,
+                                                   int16_t* rep_levels, T* values,
+                                                   int64_t* values_read) {
+  // HasNext invokes ReadNewPage
+  if (!HasNext()) {
+    *values_read = 0;
+    return 0;
+  }
+
+  // TODO(wesm): keep reading data pages until batch_size is reached, or the
+  // row group is finished
+  batch_size = std::min(batch_size, num_buffered_values_ - num_decoded_values_);
+
+  int64_t num_def_levels = 0;
+  int64_t num_rep_levels = 0;
+
+  int64_t values_to_read = 0;
+
+  // If the field is required and non-repeated, there are no definition levels
+  if (descr_->max_definition_level() > 0 && def_levels) {
+    num_def_levels = ReadDefinitionLevels(batch_size, def_levels);
+    // TODO(wesm): this tallying of values-to-decode can be performed with better
+    // cache-efficiency if fused with the level decoding.
+    for (int64_t i = 0; i < num_def_levels; ++i) {
+      if (def_levels[i] == descr_->max_definition_level()) {
+        ++values_to_read;
+      }
+    }
+  } else {
+    // Required field, read all values
+    values_to_read = batch_size;
+  }
+
+  // Not present for non-repeated fields
+  if (descr_->max_repetition_level() > 0 && rep_levels) {
+    num_rep_levels = ReadRepetitionLevels(batch_size, rep_levels);
+    if (def_levels && num_def_levels != num_rep_levels) {
+      throw ParquetException("Number of decoded rep / def levels did not match");
+    }
+  }
+
+  *values_read = ReadValues(values_to_read, values);
+  int64_t total_values = std::max(num_def_levels, *values_read);
+  num_decoded_values_ += total_values;
+
+  return total_values;
+}
+
+template <typename DType>
+int64_t TypedColumnReader<DType>::ReadBatchSpaced(
+    int64_t batch_size, int16_t* def_levels, int16_t* rep_levels, T* values,
+    uint8_t* valid_bits, int64_t valid_bits_offset, int64_t* levels_read,
+    int64_t* values_read, int64_t* null_count_out) {
+  // HasNext invokes ReadNewPage
+  if (!HasNext()) {
+    *levels_read = 0;
+    *values_read = 0;
+    *null_count_out = 0;
+    return 0;
+  }
+
+  int64_t total_values;
+  // TODO(wesm): keep reading data pages until batch_size is reached, or the
+  // row group is finished
+  batch_size = std::min(batch_size, num_buffered_values_ - num_decoded_values_);
+
+  // If the field is required and non-repeated, there are no definition levels
+  if (descr_->max_definition_level() > 0) {
+    int64_t num_def_levels = ReadDefinitionLevels(batch_size, def_levels);
+
+    // Not present for non-repeated fields
+    if (descr_->max_repetition_level() > 0) {
+      int64_t num_rep_levels = ReadRepetitionLevels(batch_size, rep_levels);
+      if (num_def_levels != num_rep_levels) {
+        throw ParquetException("Number of decoded rep / def levels did not match");
+      }
+    }
+
+    // TODO(itaiin): another code path split to merge when the general case is done
+    bool has_spaced_values;
+    if (descr_->max_repetition_level() > 0) {
+      // repeated+flat case
+      has_spaced_values = !descr_->schema_node()->is_required();
+    } else {
+      // non-repeated+nested case
+      // Find if a node forces nulls in the lowest level along the hierarchy
+      const schema::Node* node = descr_->schema_node().get();
+      has_spaced_values = false;
+      while (node) {
+        auto parent = node->parent();
+        if (node->is_optional()) {
+          has_spaced_values = true;
+          break;
+        }
+        node = parent;
+      }
+    }
+
+    int64_t null_count = 0;
+    if (!has_spaced_values) {
+      int values_to_read = 0;
+      for (int64_t i = 0; i < num_def_levels; ++i) {
+        if (def_levels[i] == descr_->max_definition_level()) {
+          ++values_to_read;
+        }
+      }
+      total_values = ReadValues(values_to_read, values);
+      for (int64_t i = 0; i < total_values; i++) {
+        ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
+      }
+      *values_read = total_values;
+    } else {
+      int16_t max_definition_level = descr_->max_definition_level();
+      int16_t max_repetition_level = descr_->max_repetition_level();
+      internal::DefinitionLevelsToBitmap(def_levels, num_def_levels, max_definition_level,
+                                         max_repetition_level, values_read, &null_count,
+                                         valid_bits, valid_bits_offset);
+      total_values = ReadValuesSpaced(*values_read, values, static_cast<int>(null_count),
+                                      valid_bits, valid_bits_offset);
+    }
+    *levels_read = num_def_levels;
+    *null_count_out = null_count;
+
+  } else {
+    // Required field, read all values
+    total_values = ReadValues(batch_size, values);
+    for (int64_t i = 0; i < total_values; i++) {
+      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
+    }
+    *null_count_out = 0;
+    *levels_read = total_values;
+  }
+
+  num_decoded_values_ += *levels_read;
+  return total_values;
+}
+
+template <typename DType>
+int64_t TypedColumnReader<DType>::Skip(int64_t num_rows_to_skip) {
+  int64_t rows_to_skip = num_rows_to_skip;
+  while (HasNext() && rows_to_skip > 0) {
+    // If the number of rows to skip is more than the number of undecoded values, skip the
+    // Page.
+    if (rows_to_skip > (num_buffered_values_ - num_decoded_values_)) {
+      rows_to_skip -= num_buffered_values_ - num_decoded_values_;
+      num_decoded_values_ = num_buffered_values_;
+    } else {
+      // We need to read this Page
+      // Jump to the right offset in the Page
+      int64_t batch_size = 1024;  // ReadBatch with a smaller memory footprint
+      int64_t values_read = 0;
+
+      std::shared_ptr<PoolBuffer> vals = AllocateBuffer(
+          this->pool_, batch_size * type_traits<DType::type_num>::value_byte_size);
+      std::shared_ptr<PoolBuffer> def_levels =
+          AllocateBuffer(this->pool_, batch_size * sizeof(int16_t));
+
+      std::shared_ptr<PoolBuffer> rep_levels =
+          AllocateBuffer(this->pool_, batch_size * sizeof(int16_t));
+
+      do {
+        batch_size = std::min(batch_size, rows_to_skip);
+        values_read = ReadBatch(static_cast<int>(batch_size),
+                                reinterpret_cast<int16_t*>(def_levels->mutable_data()),
+                                reinterpret_cast<int16_t*>(rep_levels->mutable_data()),
+                                reinterpret_cast<T*>(vals->mutable_data()), &values_read);
+        rows_to_skip -= values_read;
+      } while (values_read > 0 && rows_to_skip > 0);
+    }
+  }
+  return num_rows_to_skip - rows_to_skip;
 }
 
 // ----------------------------------------------------------------------
