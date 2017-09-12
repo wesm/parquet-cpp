@@ -69,17 +69,6 @@ static inline int64_t impala_timestamp_to_nanoseconds(const Int96& impala_timest
 template <typename ArrowType>
 using ArrayType = typename ::arrow::TypeTraits<ArrowType>::ArrayType;
 
-template <typename ArrowType, typename ParquetType>
-struct supports_fast_path_impl {
-  using ArrowCType = typename ArrowType::c_type;
-  using ParquetCType = typename ParquetType::c_type;
-  static constexpr bool value = std::is_same<ArrowCType, ParquetCType>::value;
-};
-
-template <typename ArrowType, typename ParquetType>
-using supports_fast_path = typename std::enable_if<
-  supports_fast_path_impl<ArrowType, ParquetType>::value>::type;
-
 // ----------------------------------------------------------------------
 // Iteration utilities
 
@@ -212,41 +201,37 @@ class ColumnReader::Impl {
 class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::Impl {
  public:
   PrimitiveImpl(MemoryPool* pool, std::unique_ptr<FileColumnIterator> input)
-      : pool_(pool),
-        input_(std::move(input)),
-        descr_(input_->descr()),
-        buffer_(pool) {
+      : pool_(pool), input_(std::move(input)), descr_(input_->descr()), buffer_(pool) {
     DCHECK(NodeToField(input_->descr()->schema_node(), &field_).ok());
     NextRowGroup();
   }
 
   virtual ~PrimitiveImpl() {}
 
-  Status NextBatch(int batch_size, std::shared_ptr<Array>* out) override;
+  Status NextBatch(int records_to_read, std::shared_ptr<Array>* out) override;
 
   template <typename ArrowType, typename ParquetType>
-  Status TypedReadBatch(int batch_size, std::shared_ptr<Array>* out);
+  Status TypedReadBatch(int records_to_read,
+                        std::shared_ptr<Array>* out);
+
+  template <typename ArrowType, typename ParquetType>
+  Status TransferData(std::shared_ptr<Array>* out);
 
   template <typename ArrowType>
-  Status ReadByteArrayBatch(int batch_size, std::shared_ptr<Array>* out);
+  Status ReadByteArrayBatch(int records_to_read,
+                            std::shared_ptr<Array>* out);
 
   template <typename ArrowType>
-  Status ReadFLBABatch(int batch_size, int byte_width, std::shared_ptr<Array>* out);
-
-  template <typename ArrowType>
-  Status InitDataBuffer(int batch_size);
-  Status InitValidBits(int batch_size);
+  Status ReadFLBABatch(int records_to_read, int byte_width,
+                       std::shared_ptr<Array>* out);
 
   template <typename ArrowType, typename ParquetType, typename Enable = void>
-  Status ReadNullableBatch(int16_t* def_levels, int16_t* rep_levels,
-                           int64_t values_to_read, int64_t* levels_read,
-                           int64_t* values_read);
+  Status ReadNullableBatch(int64_t records_to_read);
 
   template <typename ArrowType, typename ParquetType, typename Enable = void>
-  Status ReadNonNullableBatch(int64_t values_to_read, int64_t* levels_read);
+  Status ReadNonNullableBatch(int64_t records_to_read);
 
-  Status WrapIntoListArray(const int16_t* def_levels, const int16_t* rep_levels,
-                           int64_t total_values_read, std::shared_ptr<Array>* array);
+  Status WrapIntoListArray(std::shared_ptr<Array>* array);
 
   Status GetDefLevels(ValueLevelsPtr* data, size_t* length) override;
   Status GetRepLevels(ValueLevelsPtr* data, size_t* length) override;
@@ -268,17 +253,11 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::Impl {
   std::unique_ptr<FileColumnIterator> input_;
   const ColumnDescriptor* descr_;
 
+  // An appropriate instance of a RecordReader<T>, which inherits from
+  // ::parquet::ColumnReader
   std::shared_ptr<::parquet::ColumnReader> column_reader_;
+
   std::shared_ptr<Field> field_;
-
-  ColumnDecodeBuffer buffer_;
-
-  std::shared_ptr<PoolBuffer> data_buffer_;
-  uint8_t* data_buffer_ptr_;
-  std::shared_ptr<PoolBuffer> valid_bits_buffer_;
-  uint8_t* valid_bits_ptr_;
-  int64_t valid_bits_idx_;
-  int64_t null_count_;
 };
 
 // Reader implementation for struct array
@@ -618,280 +597,6 @@ const ParquetFileReader* FileReader::parquet_reader() const {
   return impl_->parquet_reader();
 }
 
-template <typename ArrowType, typename ParquetType, typename Enable = void>
-Status PrimitiveImpl::ReadNonNullableBatch(int64_t values_to_read, int64_t* levels_read) {
-  using ArrowCType = typename ArrowType::c_type;
-  using ParquetCType = typename ParquetType::c_type;
-
-  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
-  DCHECK(reader);
-
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(ParquetCType), false));
-  auto values = reinterpret_cast<ParquetCType*>(values_buffer_.mutable_data());
-  int64_t values_read;
-  PARQUET_CATCH_NOT_OK(*levels_read =
-                           reader->ReadBatch(static_cast<int>(values_to_read), nullptr,
-                                             nullptr, values, &values_read));
-
-  ArrowCType* out_ptr = reinterpret_cast<ArrowCType*>(data_buffer_ptr_);
-  std::copy(values, values + values_read, out_ptr + valid_bits_idx_);
-  valid_bits_idx_ += values_read;
-
-  return Status::OK();
-}
-
-template <typename ArrowType, typename ParquetType>
-Status PrimitiveImpl::ReadNonNullableBatch<
-  ArrowType, ParquetType, supports_fast_path<ArrowType, ParquetType>>(
-      int64_t values_to_read,
-      int64_t * levels_read) {
-  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
-  DCHECK(reader);
-
-  int64_t values_read;
-  CType* out_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);
-  PARQUET_CATCH_NOT_OK(*levels_read = reader->ReadBatch(
-      static_cast<int>(values_to_read), nullptr, nullptr,
-      out_ptr + valid_bits_idx_, &values_read));
-
-  valid_bits_idx_ += values_read;
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::ReadNonNullableBatch<::arrow::TimestampType, Int96Type>(
-    int64_t values_to_read, int64_t* levels_read) {
-  auto reader = dynamic_cast<TypedColumnReader<Int96Type>*>(column_reader_.get());
-  DCHECK(reader);
-
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(Int96), false));
-  auto values = reinterpret_cast<Int96*>(values_buffer_.mutable_data());
-  int64_t values_read;
-  PARQUET_CATCH_NOT_OK(*levels_read =
-                           reader->ReadBatch(static_cast<int>(values_to_read), nullptr,
-                                             nullptr, values, &values_read));
-
-  int64_t* out_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_) + valid_bits_idx_;
-  for (int64_t i = 0; i < values_read; i++) {
-    *out_ptr++ = impala_timestamp_to_nanoseconds(values[i]);
-  }
-  valid_bits_idx_ += values_read;
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::ReadNonNullableBatch<::arrow::Date64Type, Int32Type>(
-    int64_t values_to_read, int64_t* levels_read) {
-  auto reader = dynamic_cast<TypedColumnReader<Int32Type>*>(column_reader_.get());
-  DCHECK(reader);
-
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(int32_t), false));
-  auto values = reinterpret_cast<int32_t*>(values_buffer_.mutable_data());
-  int64_t values_read;
-  PARQUET_CATCH_NOT_OK(*levels_read =
-                           reader->ReadBatch(static_cast<int>(values_to_read), nullptr,
-                                             nullptr, values, &values_read));
-
-  int64_t* out_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_) + valid_bits_idx_;
-  for (int64_t i = 0; i < values_read; i++) {
-    *out_ptr++ = static_cast<int64_t>(values[i]) * 86400000;
-  }
-  valid_bits_idx_ += values_read;
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::ReadNonNullableBatch<::arrow::BooleanType, BooleanType>(
-    int64_t values_to_read, int64_t* levels_read) {
-  auto reader = dynamic_cast<TypedColumnReader<BooleanType>*>(column_reader_.get());
-  DCHECK(reader);
-
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(bool), false));
-  auto values = reinterpret_cast<bool*>(values_buffer_.mutable_data());
-  int64_t values_read;
-  PARQUET_CATCH_NOT_OK(*levels_read =
-                           reader->ReadBatch(static_cast<int>(values_to_read), nullptr,
-                                             nullptr, values, &values_read));
-
-  for (int64_t i = 0; i < values_read; i++) {
-    if (values[i]) {
-      ::arrow::BitUtil::SetBit(data_buffer_ptr_, valid_bits_idx_);
-    }
-    valid_bits_idx_++;
-  }
-
-  return Status::OK();
-}
-
-template <typename ArrowType, typename ParquetType>
-  Status PrimitiveImpl::ReadNullableBatch<
-      ArrowType, ParquetType,
-       supports_fast_path<ArrowType, ParquetType>>(int16_t* def_levels, int16_t* rep_levels,
-  int64_t values_to_read, int64_t* levels_read,
-                                        int64_t* values_read) {
-  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
-  DCHECK(reader);
-
-  using ArrowCType = typename ArrowType::c_type;
-  using ParquetCType = typename ParquetType::c_type;
-
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(ParquetCType), false));
-  auto values = reinterpret_cast<ParquetCType*>(values_buffer_.mutable_data());
-  int64_t null_count;
-  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
-      static_cast<int>(values_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
-      valid_bits_idx_, levels_read, values_read, &null_count));
-
-  auto data_ptr = reinterpret_cast<ArrowCType*>(data_buffer_ptr_);
-  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
-
-  for (int64_t i = 0; i < *values_read; i++) {
-    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
-      data_ptr[valid_bits_idx_ + i] = values[i];
-    }
-    READ_NEXT_BITSET(valid_bits_ptr_);
-  }
-  null_count_ += null_count;
-  valid_bits_idx_ += *values_read;
-
-  return Status::OK();
-}
-
-template <typename ArrowType, typename ParquetType>
-Status PrimitiveImpl::ReadNullableBatch<
-  ArrowType, ParquetType
-  supports_fast_path<ArrowType, ParquetType>>(
-    int16_t * def_levels, int16_t * rep_levels, int64_t values_to_read,
-int64_t * levels_read, int64_t * values_read) {
-  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
-  DCHECK(reader);
-
-  auto data_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);
-  int64_t null_count;
-  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
-      static_cast<int>(values_to_read), def_levels, rep_levels,
-      data_ptr + valid_bits_idx_, valid_bits_ptr_, valid_bits_idx_, levels_read,
-      values_read, &null_count));
-
-  valid_bits_idx_ += *values_read;
-  null_count_ += null_count;
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::ReadNullableBatch<::arrow::TimestampType, Int96Type>(
-    TypedColumnReader<Int96Type>* reader, int16_t* def_levels, int16_t* rep_levels,
-    int64_t values_to_read, int64_t* levels_read, int64_t* values_read) {
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(Int96), false));
-  auto values = reinterpret_cast<Int96*>(values_buffer_.mutable_data());
-  int64_t null_count;
-  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
-      static_cast<int>(values_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
-      valid_bits_idx_, levels_read, values_read, &null_count));
-
-  auto data_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_);
-  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
-  for (int64_t i = 0; i < *values_read; i++) {
-    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
-      data_ptr[valid_bits_idx_ + i] = impala_timestamp_to_nanoseconds(values[i]);
-    }
-    READ_NEXT_BITSET(valid_bits_ptr_);
-  }
-  null_count_ += null_count;
-  valid_bits_idx_ += *values_read;
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::ReadNullableBatch<::arrow::Date64Type, Int32Type>(
-    TypedColumnReader<Int32Type>* reader, int16_t* def_levels, int16_t* rep_levels,
-    int64_t values_to_read, int64_t* levels_read, int64_t* values_read) {
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(int32_t), false));
-  auto values = reinterpret_cast<int32_t*>(values_buffer_.mutable_data());
-  int64_t null_count;
-  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
-      static_cast<int>(values_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
-      valid_bits_idx_, levels_read, values_read, &null_count));
-
-  auto data_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_);
-  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
-  for (int64_t i = 0; i < *values_read; i++) {
-    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
-      data_ptr[valid_bits_idx_ + i] = static_cast<int64_t>(values[i]) * 86400000;
-    }
-    READ_NEXT_BITSET(valid_bits_ptr_);
-  }
-  null_count_ += null_count;
-  valid_bits_idx_ += *values_read;
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::ReadNullableBatch<::arrow::BooleanType, BooleanType>(
-    TypedColumnReader<BooleanType>* reader, int16_t* def_levels, int16_t* rep_levels,
-    int64_t values_to_read, int64_t* levels_read, int64_t* values_read) {
-  RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(bool), false));
-  auto values = reinterpret_cast<bool*>(values_buffer_.mutable_data());
-  int64_t null_count;
-  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
-      static_cast<int>(values_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
-      valid_bits_idx_, levels_read, values_read, &null_count));
-
-  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
-  for (int64_t i = 0; i < *values_read; i++) {
-    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
-      if (values[i]) {
-        ::arrow::BitUtil::SetBit(data_buffer_ptr_, valid_bits_idx_ + i);
-      }
-    }
-    READ_NEXT_BITSET(valid_bits_ptr_);
-  }
-  valid_bits_idx_ += *values_read;
-  null_count_ += null_count;
-
-  return Status::OK();
-}
-
-template <typename ArrowType>
-Status PrimitiveImpl::InitDataBuffer(int batch_size) {
-  using ArrowCType = typename ArrowType::c_type;
-  data_buffer_ = std::make_shared<PoolBuffer>(pool_);
-  RETURN_NOT_OK(data_buffer_->Resize(batch_size * sizeof(ArrowCType), false));
-  data_buffer_ptr_ = data_buffer_->mutable_data();
-
-  return Status::OK();
-}
-
-template <>
-Status PrimitiveImpl::InitDataBuffer<::arrow::BooleanType>(int batch_size) {
-  data_buffer_ = std::make_shared<PoolBuffer>(pool_);
-  RETURN_NOT_OK(data_buffer_->Resize(::arrow::BitUtil::CeilByte(batch_size) / 8, false));
-  data_buffer_ptr_ = data_buffer_->mutable_data();
-  memset(data_buffer_ptr_, 0, data_buffer_->size());
-
-  return Status::OK();
-}
-
-Status PrimitiveImpl::InitValidBits(int batch_size) {
-  valid_bits_idx_ = 0;
-  if (descr_->max_definition_level() > 0) {
-    int valid_bits_size =
-        static_cast<int>(::arrow::BitUtil::CeilByte(batch_size + 1)) / 8;
-    valid_bits_buffer_ = std::make_shared<PoolBuffer>(pool_);
-    RETURN_NOT_OK(valid_bits_buffer_->Resize(valid_bits_size, false));
-    valid_bits_ptr_ = valid_bits_buffer_->mutable_data();
-    memset(valid_bits_ptr_, 0, valid_bits_size);
-    null_count_ = 0;
-  }
-  return Status::OK();
-}
-
 Status PrimitiveImpl::WrapIntoListArray(const int16_t* def_levels,
                                         const int16_t* rep_levels,
                                         int64_t total_levels_read,
@@ -1010,39 +715,9 @@ Status PrimitiveImpl::WrapIntoListArray(const int16_t* def_levels,
 }
 
 template <typename ArrowType, typename ParquetType>
-Status PrimitiveImpl::TypedReadBatch(int batch_size, std::shared_ptr<Array>* out) {
-  using ArrowCType = typename ArrowType::c_type;
+Status PrimitiveImpl::TransferData(std::shared_ptr<Array>* out) {
+  auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
 
-  int values_to_read = batch_size;
-  int total_levels_read = 0;
-  RETURN_NOT_OK(InitDataBuffer<ArrowType>(batch_size));
-  RETURN_NOT_OK(InitValidBits(batch_size));
-
-  RETURN_NOT_OK(buffer_.Reserve(descr_, batch_size));
-
-  while ((values_to_read > 0) && column_reader_) {
-    auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
-    int64_t values_read;
-    int64_t levels_read;
-    if (descr_->max_definition_level() == 0) {
-      RETURN_NOT_OK((ReadNonNullableBatch<ArrowType, ParquetType>(reader, values_to_read,
-                                                                  &values_read)));
-    } else {
-      int16_t* def_levels = buffer_.def_levels();
-      int16_t* rep_levels = buffer_.rep_levels();
-
-      // As per the defintion and checks for flat (list) columns:
-      // descr_->max_definition_level() > 0, <= 3
-      RETURN_NOT_OK((ReadNullableBatch<ArrowType, ParquetType>(
-          reader, def_levels + total_levels_read, rep_levels + total_levels_read,
-          values_to_read, &levels_read, &values_read)));
-      total_levels_read += static_cast<int>(levels_read);
-    }
-    values_to_read -= static_cast<int>(values_read);
-    if (!column_reader_->HasNext()) {
-      NextRowGroup();
-    }
-  }
 
   // Shrink arrays as they may be larger than the output.
   RETURN_NOT_OK(data_buffer_->Resize(valid_bits_idx_ * sizeof(ArrowCType)));
@@ -1059,111 +734,94 @@ Status PrimitiveImpl::TypedReadBatch(int batch_size, std::shared_ptr<Array>* out
     *out = std::make_shared<ArrayType<ArrowType>>(field_->type(), valid_bits_idx_,
                                                   data_buffer_);
   }
-  // Relase the ownership as the Buffer is now part of a new Array
-  data_buffer_.reset();
+
+  reader->Reset();
 
   // Check if we should transform this array into an list array.
-  return WrapIntoListArray(def_levels, rep_levels, total_levels_read, out);
+  return WrapIntoListArray(out);
 }
 
-template <>
-Status PrimitiveImpl::TypedReadBatch<::arrow::BooleanType, BooleanType>(
-    int batch_size, std::shared_ptr<Array>* out) {
-  int values_to_read = batch_size;
-  int total_levels_read = 0;
-  RETURN_NOT_OK(InitDataBuffer<::arrow::BooleanType>(batch_size));
-  RETURN_NOT_OK(InitValidBits(batch_size));
-  if (descr_->max_definition_level() > 0) {
-    RETURN_NOT_OK(def_levels_buffer_.Resize(batch_size * sizeof(int16_t), false));
-  }
-  if (descr_->max_repetition_level() > 0) {
-    RETURN_NOT_OK(rep_levels_buffer_.Resize(batch_size * sizeof(int16_t), false));
-  }
-  int16_t* def_levels = reinterpret_cast<int16_t*>(def_levels_buffer_.mutable_data());
-  int16_t* rep_levels = reinterpret_cast<int16_t*>(rep_levels_buffer_.mutable_data());
 
-  while ((values_to_read > 0) && column_reader_) {
-    auto reader = dynamic_cast<TypedColumnReader<BooleanType>*>(column_reader_.get());
+// Boolean code path for transfer data
+
+  // if (descr_->max_definition_level() > 0) {
+  //   // TODO: Shrink arrays in the case they are too large
+  //   if (valid_bits_idx_ < batch_size * 0.8) {
+  //     // Shrink arrays as they are larger than the output.
+  //     // TODO(PARQUET-761/ARROW-360): Use realloc internally to shrink the arrays
+  //     //    without the need for a copy. Given a decent underlying allocator this
+  //     //    should still free some underlying pages to the OS.
+
+  //     auto data_buffer = std::make_shared<PoolBuffer>(pool_);
+  //     RETURN_NOT_OK(data_buffer->Resize(valid_bits_idx_ * sizeof(bool)));
+  //     memcpy(data_buffer->mutable_data(), data_buffer_->data(), data_buffer->size());
+  //     data_buffer_ = data_buffer;
+
+  //     auto valid_bits_buffer = std::make_shared<PoolBuffer>(pool_);
+  //     RETURN_NOT_OK(
+  //         valid_bits_buffer->Resize(::arrow::BitUtil::CeilByte(valid_bits_idx_) / 8));
+  //     memcpy(valid_bits_buffer->mutable_data(), valid_bits_buffer_->data(),
+  //            valid_bits_buffer->size());
+  //     valid_bits_buffer_ = valid_bits_buffer;
+  //   }
+  //   *out = std::make_shared<BooleanArray>(field_->type(), valid_bits_idx_, data_buffer_,
+  //                                         valid_bits_buffer_, null_count_);
+  //   // Relase the ownership
+  //   data_buffer_.reset();
+  //   valid_bits_buffer_.reset();
+  // } else {
+  //   *out = std::make_shared<BooleanArray>(field_->type(), valid_bits_idx_, data_buffer_);
+  //   data_buffer_.reset();
+  // }
+
+template <typename ArrowType, typename ParquetType>
+struct supports_fast_path_impl {
+  using ArrowCType = typename ArrowType::c_type;
+  using ParquetCType = typename ParquetType::c_type;
+  static constexpr bool value = std::is_same<ArrowCType, ParquetCType>::value;
+};
+
+template <typename ArrowType, typename ParquetType>
+using supports_fast_path =
+    typename std::enable_if<supports_fast_path_impl<ArrowType, ParquetType>::value>::type;
+
+template <typename ArrowType, typename ParquetType>
+Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read, std::shared_ptr<Array>* out) {
+  using ArrowCType = typename ArrowType::c_type;
+
+  auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
+
+  reader->Reserve(batch_size);
+
+  while ((records_to_read > 0) && column_reader_) {
     int64_t values_read;
     int64_t levels_read;
-    int16_t* def_levels = reinterpret_cast<int16_t*>(def_levels_buffer_.mutable_data());
-    if (descr_->max_definition_level() == 0) {
-      RETURN_NOT_OK((ReadNonNullableBatch<::arrow::BooleanType, BooleanType>(
-          reader, values_to_read, &values_read)));
-    } else {
-      // As per the defintion and checks for flat columns:
-      // descr_->max_definition_level() == 1
-      RETURN_NOT_OK((ReadNullableBatch<::arrow::BooleanType, BooleanType>(
-          reader, def_levels + total_levels_read, rep_levels + total_levels_read,
-          values_to_read, &levels_read, &values_read)));
-      total_levels_read += static_cast<int>(levels_read);
-    }
-    values_to_read -= static_cast<int>(values_read);
+    records_to_read -= reader->ReadRecords(records_to_read);
     if (!column_reader_->HasNext()) {
       NextRowGroup();
     }
   }
-
-  if (descr_->max_definition_level() > 0) {
-    // TODO: Shrink arrays in the case they are too large
-    if (valid_bits_idx_ < batch_size * 0.8) {
-      // Shrink arrays as they are larger than the output.
-      // TODO(PARQUET-761/ARROW-360): Use realloc internally to shrink the arrays
-      //    without the need for a copy. Given a decent underlying allocator this
-      //    should still free some underlying pages to the OS.
-
-      auto data_buffer = std::make_shared<PoolBuffer>(pool_);
-      RETURN_NOT_OK(data_buffer->Resize(valid_bits_idx_ * sizeof(bool)));
-      memcpy(data_buffer->mutable_data(), data_buffer_->data(), data_buffer->size());
-      data_buffer_ = data_buffer;
-
-      auto valid_bits_buffer = std::make_shared<PoolBuffer>(pool_);
-      RETURN_NOT_OK(
-          valid_bits_buffer->Resize(::arrow::BitUtil::CeilByte(valid_bits_idx_) / 8));
-      memcpy(valid_bits_buffer->mutable_data(), valid_bits_buffer_->data(),
-             valid_bits_buffer->size());
-      valid_bits_buffer_ = valid_bits_buffer;
-    }
-    *out = std::make_shared<BooleanArray>(field_->type(), valid_bits_idx_, data_buffer_,
-                                          valid_bits_buffer_, null_count_);
-    // Relase the ownership
-    data_buffer_.reset();
-    valid_bits_buffer_.reset();
-  } else {
-    *out = std::make_shared<BooleanArray>(field_->type(), valid_bits_idx_, data_buffer_);
-    data_buffer_.reset();
-  }
-
-  // Check if we should transform this array into an list array.
-  return WrapIntoListArray(def_levels, rep_levels, total_levels_read, out);
 }
 
 template <typename ArrowType>
-Status PrimitiveImpl::ReadByteArrayBatch(int batch_size, std::shared_ptr<Array>* out) {
+Status PrimitiveImpl::ReadByteArrayBatch(int64_t records_to_read, std::shared_ptr<Array>* out) {
   using BuilderType = typename ::arrow::TypeTraits<ArrowType>::BuilderType;
 
   int total_levels_read = 0;
-  if (descr_->max_definition_level() > 0) {
-    RETURN_NOT_OK(def_levels_buffer_.Resize(batch_size * sizeof(int16_t), false));
-  }
-  if (descr_->max_repetition_level() > 0) {
-    RETURN_NOT_OK(rep_levels_buffer_.Resize(batch_size * sizeof(int16_t), false));
-  }
-  int16_t* def_levels = reinterpret_cast<int16_t*>(def_levels_buffer_.mutable_data());
-  int16_t* rep_levels = reinterpret_cast<int16_t*>(rep_levels_buffer_.mutable_data());
 
-  int values_to_read = batch_size;
+  int records_to_read = batch_size;
   BuilderType builder(pool_);
-  while ((values_to_read > 0) && column_reader_) {
-    RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(ByteArray), false));
-    auto reader = dynamic_cast<TypedColumnReader<ByteArrayType>*>(column_reader_.get());
+  while ((records_to_read > 0) && column_reader_) {
+    RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(ByteArray), false));
+    auto reader = dynamic_cast<RecordReader<ByteArrayType>*>(column_reader_.get());
     int64_t values_read;
     int64_t levels_read;
     auto values = reinterpret_cast<ByteArray*>(values_buffer_.mutable_data());
     PARQUET_CATCH_NOT_OK(levels_read = reader->ReadBatch(
-                             values_to_read, def_levels + total_levels_read,
+                             records_to_read, def_levels + total_levels_read,
                              rep_levels + total_levels_read, values, &values_read));
-    values_to_read -= static_cast<int>(levels_read);
+    records_to_read -= static_cast<int>(levels_read);
     if (descr_->max_definition_level() == 0) {
       for (int64_t i = 0; i < levels_read; i++) {
         RETURN_NOT_OK(
@@ -1210,18 +868,18 @@ Status PrimitiveImpl::ReadFLBABatch(int batch_size, int byte_width,
   int16_t* def_levels = reinterpret_cast<int16_t*>(def_levels_buffer_.mutable_data());
   int16_t* rep_levels = reinterpret_cast<int16_t*>(rep_levels_buffer_.mutable_data());
 
-  int values_to_read = batch_size;
+  int records_to_read = batch_size;
   BuilderType builder(::arrow::fixed_size_binary(byte_width), pool_);
-  while ((values_to_read > 0) && column_reader_) {
-    RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(FLBA), false));
-    auto reader = dynamic_cast<TypedColumnReader<FLBAType>*>(column_reader_.get());
+  while ((records_to_read > 0) && column_reader_) {
+    RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(FLBA), false));
+    auto reader = dynamic_cast<RecordReader<FLBAType>*>(column_reader_.get());
     int64_t values_read;
     int64_t levels_read;
     auto values = reinterpret_cast<FLBA*>(values_buffer_.mutable_data());
     PARQUET_CATCH_NOT_OK(levels_read = reader->ReadBatch(
-                             values_to_read, def_levels + total_levels_read,
+                             records_to_read, def_levels + total_levels_read,
                              rep_levels + total_levels_read, values, &values_read));
-    values_to_read -= static_cast<int>(levels_read);
+    records_to_read -= static_cast<int>(levels_read);
     if (descr_->max_definition_level() == 0) {
       for (int64_t i = 0; i < levels_read; i++) {
         RETURN_NOT_OK(builder.Append(values[i].ptr));
@@ -1260,6 +918,239 @@ template <>
 Status PrimitiveImpl::TypedReadBatch<::arrow::StringType, ByteArrayType>(
     int batch_size, std::shared_ptr<Array>* out) {
   return ReadByteArrayBatch<::arrow::StringType>(batch_size, out);
+}
+
+template <typename ArrowType, typename ParquetType, typename Enable = void>
+Status PrimitiveImpl::ReadNonNullableBatch(int64_t records_to_read) {
+  using ArrowCType = typename ArrowType::c_type;
+
+  auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
+
+  int64_t records_read = 0;
+  PARQUET_CATCH_NOT_OK(records_read =
+                           reader->ReadRecords(static_cast<int>(records_to_read)));
+
+  ArrowCType* out_ptr = reinterpret_cast<ArrowCType*>(data_buffer_ptr_);
+  std::copy(reader->values(), values + reader->values_read(), out_ptr + valid_bits_idx_);
+  valid_bits_idx_ += reader->values_read();
+
+  reader->Reset();
+  return Status::OK();
+}
+
+template <typename ArrowType, typename ParquetType>
+Status PrimitiveImpl::ReadNonNullableBatch<ArrowType, ParquetType,
+                                           supports_fast_path<ArrowType, ParquetType>>(
+    int64_t records_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
+
+  int64_t values_read;
+  CType* out_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);
+  PARQUET_CATCH_NOT_OK(*levels_read = reader->ReadBatch(
+                           static_cast<int>(records_to_read), nullptr, nullptr,
+                           out_ptr + valid_bits_idx_, &values_read));
+
+  valid_bits_idx_ += values_read;
+
+  return Status::OK();
+}
+
+template <>
+Status PrimitiveImpl::ReadNonNullableBatch<::arrow::TimestampType, Int96Type>(
+    int64_t records_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<RecordReader<Int96Type>*>(column_reader_.get());
+  DCHECK(reader);
+
+  RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(Int96), false));
+  auto values = reinterpret_cast<Int96*>(values_buffer_.mutable_data());
+  int64_t values_read;
+  PARQUET_CATCH_NOT_OK(*levels_read =
+                           reader->ReadBatch(static_cast<int>(records_to_read), nullptr,
+                                             nullptr, values, &values_read));
+
+  int64_t* out_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_) + valid_bits_idx_;
+  for (int64_t i = 0; i < values_read; i++) {
+    *out_ptr++ = impala_timestamp_to_nanoseconds(values[i]);
+  }
+  valid_bits_idx_ += values_read;
+
+  return Status::OK();
+}
+
+template <>
+Status PrimitiveImpl::ReadNonNullableBatch<::arrow::Date64Type, Int32Type>(
+    int64_t records_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<RecordReader<Int32Type>*>(column_reader_.get());
+  DCHECK(reader);
+
+  RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(int32_t), false));
+  auto values = reinterpret_cast<int32_t*>(values_buffer_.mutable_data());
+  int64_t values_read;
+  PARQUET_CATCH_NOT_OK(*levels_read =
+                           reader->ReadBatch(static_cast<int>(records_to_read), nullptr,
+                                             nullptr, values, &values_read));
+
+  int64_t* out_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_) + valid_bits_idx_;
+  for (int64_t i = 0; i < values_read; i++) {
+    *out_ptr++ = static_cast<int64_t>(values[i]) * 86400000;
+  }
+  valid_bits_idx_ += values_read;
+
+  return Status::OK();
+}
+
+template <>
+Status PrimitiveImpl::ReadNonNullableBatch<::arrow::BooleanType, BooleanType>(
+    int64_t records_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<RecordReader<BooleanType>*>(column_reader_.get());
+  DCHECK(reader);
+
+  RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(bool), false));
+  auto values = reinterpret_cast<bool*>(values_buffer_.mutable_data());
+  int64_t values_read;
+  PARQUET_CATCH_NOT_OK(*levels_read =
+                           reader->ReadBatch(static_cast<int>(records_to_read), nullptr,
+                                             nullptr, values, &values_read));
+
+  for (int64_t i = 0; i < values_read; i++) {
+    if (values[i]) {
+      ::arrow::BitUtil::SetBit(data_buffer_ptr_, valid_bits_idx_);
+    }
+    valid_bits_idx_++;
+  }
+
+  return Status::OK();
+}
+
+template <typename ArrowType, typename ParquetType>
+Status PrimitiveImpl::ReadNullableBatch<ArrowType, ParquetType,
+                                        supports_fast_path<ArrowType, ParquetType>>(
+    int64_t records_to_read, int64_t* values_read) {
+  auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
+
+  using ArrowCType = typename ArrowType::c_type;
+  using ParquetCType = typename ParquetType::c_type;
+
+  PARQUET_CATCH_NOT_OK(*values_read =
+                           reader->ReadRecords(static_cast<int>(records_to_read)));
+
+  auto data_ptr = reinterpret_cast<ArrowCType*>(data_buffer_ptr_);
+
+  auto valid_bits_ptr = reader->valid_bits();
+  int64_t valid_bits_ptr = reader->valid_bits();
+
+  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
+
+  for (int64_t i = 0; i < *values_read; i++) {
+    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
+      data_ptr[valid_bits_idx_ + i] = values[i];
+    }
+    READ_NEXT_BITSET(valid_bits_ptr_);
+  }
+  null_count_ += null_count;
+  valid_bits_idx_ += *values_read;
+
+  return Status::OK();
+}
+
+template <typename ArrowType, typename ParquetType>
+Status PrimitiveImpl::ReadNullableBatch<
+    ArrowType, ParquetType supports_fast_path<ArrowType, ParquetType>>(
+    int16_t* def_levels, int16_t* rep_levels, int64_t records_to_read,
+    int64_t* levels_read, int64_t* values_read) {
+  auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
+
+  auto data_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);
+  int64_t null_count;
+  PARQUET_CATCH_NOT_OK(
+      reader->ReadBatchSpaced(static_cast<int>(records_to_read), def_levels, rep_levels,
+                              data_ptr + valid_bits_idx_, valid_bits_ptr_,
+                              valid_bits_idx_, levels_read, values_read, &null_count));
+
+  valid_bits_idx_ += *values_read;
+  null_count_ += null_count;
+
+  return Status::OK();
+}
+
+template <>
+Status PrimitiveImpl::ReadNullableBatch<::arrow::TimestampType, Int96Type>(
+    RecordReader<Int96Type>* reader, int16_t* def_levels, int16_t* rep_levels,
+    int64_t records_to_read, int64_t* levels_read, int64_t* values_read) {
+  RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(Int96), false));
+  auto values = reinterpret_cast<Int96*>(values_buffer_.mutable_data());
+  int64_t null_count;
+  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
+      static_cast<int>(records_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
+      valid_bits_idx_, levels_read, values_read, &null_count));
+
+  auto data_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_);
+  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
+  for (int64_t i = 0; i < *values_read; i++) {
+    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
+      data_ptr[valid_bits_idx_ + i] = impala_timestamp_to_nanoseconds(values[i]);
+    }
+    READ_NEXT_BITSET(valid_bits_ptr_);
+  }
+  null_count_ += null_count;
+  valid_bits_idx_ += *values_read;
+
+  return Status::OK();
+}
+
+template <>
+Status PrimitiveImpl::ReadNullableBatch<::arrow::Date64Type, Int32Type>(
+    RecordReader<Int32Type>* reader, int16_t* def_levels, int16_t* rep_levels,
+    int64_t records_to_read, int64_t* levels_read, int64_t* values_read) {
+  RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(int32_t), false));
+  auto values = reinterpret_cast<int32_t*>(values_buffer_.mutable_data());
+  int64_t null_count;
+  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
+      static_cast<int>(records_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
+      valid_bits_idx_, levels_read, values_read, &null_count));
+
+  auto data_ptr = reinterpret_cast<int64_t*>(data_buffer_ptr_);
+  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
+  for (int64_t i = 0; i < *values_read; i++) {
+    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
+      data_ptr[valid_bits_idx_ + i] = static_cast<int64_t>(values[i]) * 86400000;
+    }
+    READ_NEXT_BITSET(valid_bits_ptr_);
+  }
+  null_count_ += null_count;
+  valid_bits_idx_ += *values_read;
+
+  return Status::OK();
+}
+
+template <>
+Status PrimitiveImpl::ReadNullableBatch<::arrow::BooleanType, BooleanType>(
+    RecordReader<BooleanType>* reader, int16_t* def_levels, int16_t* rep_levels,
+    int64_t records_to_read, int64_t* levels_read, int64_t* values_read) {
+  RETURN_NOT_OK(values_buffer_.Resize(records_to_read * sizeof(bool), false));
+  auto values = reinterpret_cast<bool*>(values_buffer_.mutable_data());
+  int64_t null_count;
+  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
+      static_cast<int>(records_to_read), def_levels, rep_levels, values, valid_bits_ptr_,
+      valid_bits_idx_, levels_read, values_read, &null_count));
+
+  INIT_BITSET(valid_bits_ptr_, static_cast<int>(valid_bits_idx_));
+  for (int64_t i = 0; i < *values_read; i++) {
+    if (bitset_valid_bits_ptr_ & (1 << bit_offset_valid_bits_ptr_)) {
+      if (values[i]) {
+        ::arrow::BitUtil::SetBit(data_buffer_ptr_, valid_bits_idx_ + i);
+      }
+    }
+    READ_NEXT_BITSET(valid_bits_ptr_);
+  }
+  valid_bits_idx_ += *values_read;
+  null_count_ += null_count;
+
+  return Status::OK();
 }
 
 #define TYPED_BATCH_CASE(ENUM, ArrowType, ParquetType)              \
