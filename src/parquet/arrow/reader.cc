@@ -31,6 +31,7 @@
 #include "arrow/util/logging.h"
 
 #include "parquet/arrow/schema.h"
+#include "parquet/schema.h"
 #include "parquet/util/schema-util.h"
 
 using arrow::Array;
@@ -451,6 +452,9 @@ Status FileReader::Impl::ReadColumn(int i, std::shared_ptr<Array>* out) {
 Status FileReader::Impl::GetSchema(const std::vector<int>& indices,
                                    std::shared_ptr<::arrow::Schema>* out) {
   auto descr = reader_->metadata()->schema();
+
+  std::cout << descr->ToString() << std::endl;
+
   auto parquet_key_value_metadata = reader_->metadata()->key_value_metadata();
   return FromParquetSchema(descr, indices, parquet_key_value_metadata, out);
 }
