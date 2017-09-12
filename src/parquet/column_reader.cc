@@ -21,6 +21,9 @@
 #include <cstdint>
 #include <memory>
 
+#include <arrow/buffer.h>
+#include <arrow/memory_pool.h>
+#include <arrow/util/bit-util.h>
 #include "arrow/util/rle-encoding.h"
 
 #include "parquet/column_page.h"
@@ -30,6 +33,8 @@
 using arrow::MemoryPool;
 
 namespace parquet {
+
+namespace BitUtil = ::arrow::BitUtil;
 
 LevelDecoder::LevelDecoder() : num_values_remaining_(0) {}
 
@@ -252,58 +257,6 @@ int64_t ColumnReader::ReadRepetitionLevels(int64_t batch_size, int16_t* levels) 
   return repetition_level_decoder_.Decode(static_cast<int>(batch_size), levels);
 }
 
-namespace internal {
-
-void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
-                              int16_t max_definition_level,
-                              int16_t max_repetition_level, int64_t* values_read,
-                              int64_t* null_count, uint8_t* valid_bits,
-                              int64_t valid_bits_offset) {
-  int byte_offset = static_cast<int>(valid_bits_offset) / 8;
-  int bit_offset = static_cast<int>(valid_bits_offset) % 8;
-  uint8_t bitset = valid_bits[byte_offset];
-
-  // TODO(itaiin): As an interim solution we are splitting the code path here
-  // between repeated+flat column reads, and non-repeated+nested reads.
-  // Those paths need to be merged in the future
-  for (int i = 0; i < num_def_levels; ++i) {
-    if (def_levels[i] == max_definition_level) {
-      bitset |= (1 << bit_offset);
-    } else if (max_repetition_level > 0) {
-      // repetition+flat case
-      if (def_levels[i] == (max_definition_level - 1)) {
-        bitset &= ~(1 << bit_offset);
-        *null_count += 1;
-      } else {
-        continue;
-      }
-    } else {
-      // non-repeated+nested case
-      if (def_levels[i] < max_definition_level) {
-        bitset &= ~(1 << bit_offset);
-        *null_count += 1;
-      } else {
-        throw ParquetException("definition level exceeds maximum");
-      }
-    }
-
-    bit_offset++;
-    if (bit_offset == 8) {
-      bit_offset = 0;
-      valid_bits[byte_offset] = bitset;
-      byte_offset++;
-      // TODO: Except for the last byte, this shouldn't be needed
-      bitset = valid_bits[byte_offset];
-    }
-  }
-  if (bit_offset != 0) {
-    valid_bits[byte_offset] = bitset;
-  }
-  *values_read = (bit_offset + byte_offset * 8 - valid_bits_offset);
-}
-
-}  // namespace internal
-
 // ----------------------------------------------------------------------
 // Dynamic column reader constructor
 
@@ -345,18 +298,16 @@ int64_t TypedColumnReader<DType>::ReadValues(int64_t batch_size, T* out) {
 
 template <typename DType>
 int64_t TypedColumnReader<DType>::ReadValuesSpaced(int64_t batch_size, T* out,
-                                                          int null_count,
-                                                          uint8_t* valid_bits,
-                                                          int64_t valid_bits_offset) {
+                                                   int64_t null_count, uint8_t* valid_bits,
+                                                   int64_t valid_bits_offset) {
   return current_decoder_->DecodeSpaced(out, static_cast<int>(batch_size), null_count,
                                         valid_bits, valid_bits_offset);
 }
 
 template <typename DType>
-int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size,
-                                                   int16_t* def_levels,
-                                                   int16_t* rep_levels, T* values,
-                                                   int64_t* values_read) {
+int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size, int16_t* def_levels,
+                                            int16_t* rep_levels, T* values,
+                                            int64_t* values_read) {
   // HasNext invokes ReadNewPage
   if (!HasNext()) {
     *values_read = 0;
@@ -400,6 +351,54 @@ int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size,
   num_decoded_values_ += total_values;
 
   return total_values;
+}
+
+static void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
+                                     int16_t max_definition_level,
+                                     int16_t max_repetition_level, int64_t* values_read,
+                                     int64_t* null_count, uint8_t* valid_bits,
+                                     int64_t valid_bits_offset) {
+  int64_t byte_offset = valid_bits_offset / 8;
+  int64_t bit_offset = valid_bits_offset % 8;
+  uint8_t bitset = valid_bits[byte_offset];
+
+  // TODO(itaiin): As an interim solution we are splitting the code path here
+  // between repeated+flat column reads, and non-repeated+nested reads.
+  // Those paths need to be merged in the future
+  for (int i = 0; i < num_def_levels; ++i) {
+    if (def_levels[i] == max_definition_level) {
+      bitset |= (1 << bit_offset);
+    } else if (max_repetition_level > 0) {
+      // repetition+flat case
+      if (def_levels[i] == (max_definition_level - 1)) {
+        bitset &= ~(1 << bit_offset);
+        *null_count += 1;
+      } else {
+        continue;
+      }
+    } else {
+      // non-repeated+nested case
+      if (def_levels[i] < max_definition_level) {
+        bitset &= ~(1 << bit_offset);
+        *null_count += 1;
+      } else {
+        throw ParquetException("definition level exceeds maximum");
+      }
+    }
+
+    bit_offset++;
+    if (bit_offset == 8) {
+      bit_offset = 0;
+      valid_bits[byte_offset] = bitset;
+      byte_offset++;
+      // TODO: Except for the last byte, this shouldn't be needed
+      bitset = valid_bits[byte_offset];
+    }
+  }
+  if (bit_offset != 0) {
+    valid_bits[byte_offset] = bitset;
+  }
+  *values_read = (bit_offset + byte_offset * 8 - valid_bits_offset);
 }
 
 template <typename DType>
@@ -468,9 +467,9 @@ int64_t TypedColumnReader<DType>::ReadBatchSpaced(
     } else {
       int16_t max_definition_level = descr_->max_definition_level();
       int16_t max_repetition_level = descr_->max_repetition_level();
-      internal::DefinitionLevelsToBitmap(def_levels, num_def_levels, max_definition_level,
-                                         max_repetition_level, values_read, &null_count,
-                                         valid_bits, valid_bits_offset);
+      DefinitionLevelsToBitmap(def_levels, num_def_levels, max_definition_level,
+                               max_repetition_level, values_read, &null_count, valid_bits,
+                               valid_bits_offset);
       total_values = ReadValuesSpaced(*values_read, values, static_cast<int>(null_count),
                                       valid_bits, valid_bits_offset);
     }
@@ -528,6 +527,213 @@ int64_t TypedColumnReader<DType>::Skip(int64_t num_rows_to_skip) {
 }
 
 // ----------------------------------------------------------------------
+// RecordReader
+
+template <typename DType>
+void RecordReader<DType>::RecordReader(const ColumnDescriptor* descr,
+                                       ::arrow::MemoryPool* pool)
+    : TypedColumnReader<DType>(descr, pool),
+      max_def_level_(descr->max_definition_level()),
+      max_rep_level_(descr->max_repetition_level()),
+      at_record_start_(false),
+      records_read_(0),
+      values_written_(0),
+      values_capacity_(0),
+      null_count_(0),
+      levels_position_(0),
+      levels_written_(0),
+      levels_capacity_(0) {
+  nullable_values_ = = !descr->schema_node()->is_required();
+  values_ = std::make_shared<PoolBuffer>(pool_);
+  valid_bits_ = std::make_shared<PoolBuffer>(pool_);
+  def_levels_ = std::make_shared<PoolBuffer>(pool_);
+  rep_levels_ = std::make_shared<PoolBuffer>(pool_);
+}
+
+template <typename DType>
+void RecordReader<DType>::Reset() {
+  // Resize to 0, but do not shrink to fit
+  PARQUET_THROW_NOT_OK(values_.Resize(0, false));
+  PARQUET_THROW_NOT_OK(valid_bits_.Resize(0, false));
+  PARQUET_THROW_NOT_OK(def_levels_.Resize(0, false));
+  PARQUET_THROW_NOT_OK(rep_levels_.Resize(0, false));
+}
+
+template <typename DType>
+void RecordReader::Reserve(int64_t capacity) {
+  int64_t new_levels_capacity = levels_capacity_ + capacity;
+  if (descr_->max_definition_level() > 0) {
+    PARQUET_THROW_NOT_OK(
+        def_levels_.Resize(new_levels_capacity * sizeof(int16_t), false));
+    PARQUET_THROW_NOT_OK(
+        valid_bits_.Resize(::arrow::BitUtil::BytesForBits(new_levels_capacity), false));
+  }
+  if (descr_->max_repetition_level() > 0) {
+    PARQUET_THROW_NOT_OK(
+        rep_levels_.Resize(new_levels_capacity * sizeof(int16_t), false));
+  }
+  int64_t new_values_capacity = values_capacity_ + capacity;
+
+  int type_size = GetTypeByteSize(descr_->physical_type());
+  PARQUET_THROW_NOT_OK(values_.Resize(new_values_capacity * type_size, false));
+
+  values_capacity_ = new_values_capacity;
+  levels_capacity_ = new_levels_capacity;
+}
+
+template <typename DType>
+void RecordReader<DType>::AdvanceWritten(int64_t levels_written, int64_t values_written) {
+
+}
+
+template <typename DType>
+void RecordReader<DType>::Advance(int64_t levels_consumed, int64_t values_consumed) {
+  levels_position_ += levels_consumed;
+  if (levels_position_ == levels_written_) {
+    levels_position_ = 0;
+  }
+
+  values_position_ += values_consumed;
+  if (values_position_ == values_written_) {
+    values_position_ = 0;
+  }
+}
+
+template <typename DType>
+int64_t RecordReader<DType>::DelimitRecords(int64_t num_records, int64_t* values_seen) {
+  int64_t values_to_read = 0;
+  int64_t records_read = 0;
+
+  if (max_rep_level_ > 0) {
+    // Count logical records and number of values to read
+    for (; level_position_ < levels_written_; ++level_position_) {
+      if (def_levels[level_position_] == max_def_level_) {
+        ++values_to_read;
+      }
+      if (rep_levels[level_position_] == 0) {
+        ++records_read;
+        at_record_start_ = true;
+      } else {
+        at_record_start_ = false;
+      }
+    }
+  } else {
+    if (max_def_level_ > 0) {
+      for (; level_position_ < levels_written_; ++level_position_) {
+        if (def_levels[level_position_] == max_def_level_) {
+          ++values_to_read;
+        }
+        ++records_read;
+      }
+    } else {
+      values_to_read += batch_size;
+      records_read += batch_size;
+    }
+  }
+  *values_seen = values_to_read;
+  return records_read;
+}
+
+template <typename DType>
+int64_t RecordReader<DType>::ReadRecords(int64_t num_records) {
+  // HasNext invokes ReadNewPage
+  if (!HasNext()) {
+    return;
+  }
+
+  // Delimit records, then read values at the end
+  int64_t values_seen = 0;
+  int64_t values_to_read = 0;
+  int64_t records_read = 0;
+
+  int64_t level_start_position = level_position_;
+
+  if (values_position_ < values_written_) {
+    records_read += DelimitRecords(num_records, &values_seen);
+    values_to_read += values_seen;
+  }
+
+  DCHECK_EQ(values_position_, values_written_);
+
+  // If we are in the middle of a record, we continue until reaching the
+  // desired number of records or the end of the current record if we've found
+  // enough records
+  while (!at_record_start_ || records_read < num_records) {
+    /// We perform multiple batch reads until we either exhaust the row group
+    /// or observe the desired number of records
+    int64_t batch_size =
+        std::min(num_records - records_read, num_buffered_values_ - num_decoded_values_);
+    Reserve(batch_size);
+
+    int16_t* def_levels = out->def_levels() + levels_written_;
+    int16_t* rep_levels = out->rep_levels() + levels_written_;
+
+    // Not present for non-repeated fields
+    int64_t levels_read = 0;
+    if (max_rep_level_ > 0) {
+      levels_read = ReadDefinitionLevels(batch_size, def_levels);
+      if (ReadRepetitionLevels(batch_size, rep_levels) != levels_read) {
+        throw ParquetException("Number of decoded rep / def levels did not match");
+      }
+    } else if (max_def_level_ > 0) {
+      levels_read = ReadDefinitionLevels(batch_size, def_levels);
+    }
+
+    levels_written_ += levels_read;
+    num_decoded_values_ += levels_read;
+
+    records_read += DelimitRecords(num_records - records_read, &values_seen);
+    values_to_read += values_seen;
+
+    // Exhausted data page
+    if (levels_read == 0) {
+      break;
+    }
+  }
+
+  PopulateValues(values_to_read);
+  return records_read;
+}
+
+template <typename DType>
+void RecordReader<DType>::PopulateValues(int64_t values_to_read,
+                                         int64_t start_level_position) {
+  int64_t actual_read = 0;
+  int64_t null_count = 0;
+
+  uint8_t* valid_bits = valid_bits_->mutable_data();
+  const int64_t valid_bits_offset = values_written_;
+  if (nullable_values_) {
+    int64_t implied_values_read = 0;
+    int64_t null_count = 0;
+    DefinitionLevelsToBitmap(this->def_levels() + start_level_position,
+                             levels_position_ - start_level_position, max_def_level_,
+                             max_rep_level_, &implied_values_read, &null_count,
+                             valid_bits, valid_bits_offset);
+    actual_read =
+        ReadValuesSpaced(values_to_read, this->values(), static_cast<int>(null_count),
+                         valid_bits, valid_bits_offset);
+  } else {
+    actual_read = ReadValues(values_to_read, this->values());
+    for (int64_t i = 0; i < values_to_read; i++) {
+      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
+    }
+  }
+
+  if (actual_values_read != values_to_read) {
+    std::stringstream ss;
+    ss << "Expected to be able to decode " << values_to_read << " values but got "
+       << actual_values_read;
+    throw ParquetException(ss.str());
+  }
+
+  values_written_ += values_to_read;
+  null_count_ += null_count;
+
+  return total_values;
+}
+
+// ----------------------------------------------------------------------
 // Instantiate templated classes
 
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<BooleanType>;
@@ -538,5 +744,14 @@ template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<FloatType>;
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<DoubleType>;
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<ByteArrayType>;
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<FLBAType>;
+
+template class PARQUET_TEMPLATE_EXPORT RecordReader<BooleanType>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<Int32Type>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<Int64Type>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<Int96Type>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<FloatType>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<DoubleType>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<ByteArrayType>;
+template class PARQUET_TEMPLATE_EXPORT RecordReader<FLBAType>;
 
 }  // namespace parquet

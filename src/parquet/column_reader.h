@@ -26,10 +26,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <arrow/buffer.h>
-#include <arrow/memory_pool.h>
-#include <arrow/util/bit-util.h>
-
 #include "parquet/column_page.h"
 #include "parquet/encoding.h"
 #include "parquet/exception.h"
@@ -132,70 +128,7 @@ class PARQUET_EXPORT ColumnReader {
   ::arrow::MemoryPool* pool_;
 };
 
-
-class PARQUET_EXPORT ColumnDecodeBuffer {
- public:
-  ColumnDecodeBuffer(::arrow::MemoryPool* pool)
-      : num_values_(0),
-        values_position_(0),
-        num_levels_(0),
-        levels_position_(0),
-        values_(pool),
-        def_levels_(pool),
-        rep_levels_(pool) {}
-
-  void Reserve(const ColumnDescriptor* descr, int64_t capacity) {
-    int64_t new_levels_capacity = levels_capacity_ + capacity;
-    if (descr->max_definition_level() > 0) {
-      PARQUET_THROW_NOT_OK(
-          def_levels_.Resize(new_levels_capacity * sizeof(int16_t), false));
-    }
-    if (descr->max_repetition_level() > 0) {
-      PARQUET_THROW_NOT_OK(
-          rep_levels_.Resize(new_levels_capacity * sizeof(int16_t), false));
-    }
-    int64_t new_values_capacity = values_capacity_ + capacity;
-
-    int type_size = GetTypeByteSize(descr->physical_type());
-    PARQUET_THROW_NOT_OK(
-        values_.Resize(new_values_capacity * type_size, false));
-  }
-
-  void Advance(int64_t levels_consumed, int64_t values_consumed) {
-    levels_position_ += levels_consumed;
-    if (levels_position_ == num_levels_) {
-      levels_position_ = 0;
-    }
-
-    values_position_ += values_consumed;
-    if (values_position_ == num_values_) {
-      values_position_ = 0;
-    }
-  }
-
-  int16_t* def_levels() {
-    return reinterpret_cast<int16_t*>(def_levels_.mutable_data()) + levels_position_;
-  }
-
-  int16_t* rep_levels() {
-    return reinterpret_cast<int16_t*>(rep_levels_.mutable_data()) + levels_position_;
-  }
-
- private:
-  int64_t num_values_;
-  int64_t values_position_;
-  int64_t values_capacity_;
-
-  int64_t num_levels_;
-  int64_t levels_position_;
-  int64_t levels_capacity_;
-
-  ::arrow::PoolBuffer values_;
-  ::arrow::PoolBuffer def_levels_;
-  ::arrow::PoolBuffer rep_levels_;
-};
-
-// API to read values from a single column. This is the main client facing API.
+// API to read values from a single column. This is a main client facing API.
 template <typename DType>
 class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
  public:
@@ -225,9 +158,6 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
   // @returns: actual number of levels read (see values_read for number of values read)
   int64_t ReadBatch(int64_t batch_size, int16_t* def_levels, int16_t* rep_levels,
                     T* values, int64_t* values_read);
-
-  // int64_t ReadBatch(int64_t batch_size, ColumnDecodeBuffer* out,
-  //                   int64_t* values_read);
 
   /// Read a batch of repetition levels, definition levels, and values from the
   /// column and leave spaces for null entries on the lowest level in the values
@@ -263,20 +193,16 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
   ///   (i.e. definition_level == max_definition_level - 1)
   /// @param[out] null_count The number of nulls on the lowest levels.
   ///   (i.e. (values_read - null_count) is total number of non-null entries)
-  int64_t ReadBatchSpaced(int64_t batch_size,
-                          int16_t* def_levels, int16_t* rep_levels,
+  int64_t ReadBatchSpaced(int64_t batch_size, int16_t* def_levels, int16_t* rep_levels,
                           T* values, uint8_t* valid_bits, int64_t valid_bits_offset,
                           int64_t* levels_read, int64_t* values_read,
                           int64_t* null_count);
-
-  // int64_t ReadBatchSpaced(int64_t batch_size, ColumnDecodeBuffer* out,
-  //                         int64_t* values_read);
 
   // Skip reading levels
   // Returns the number of levels skipped
   int64_t Skip(int64_t num_rows_to_skip);
 
- private:
+ protected:
   typedef Decoder<DType> DecoderType;
 
   // Advance to the next data page
@@ -293,7 +219,7 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
   // to the def_levels.
   //
   // @returns: the number of values read into the out buffer
-  int64_t ReadValuesSpaced(int64_t batch_size, T* out, int null_count,
+  int64_t ReadValuesSpaced(int64_t batch_size, T* out, int64_t null_count,
                            uint8_t* valid_bits, int64_t valid_bits_offset);
 
   // Map of encoding type to the respective decoder object. For example, a
@@ -304,6 +230,67 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
   void ConfigureDictionary(const DictionaryPage* page);
 
   DecoderType* current_decoder_;
+};
+
+/// \brief Stateful column reader that delimits semantic records for both flat
+/// and nested columns
+template <typename DType>
+class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
+  RecordReader(const ColumnDescriptor* descr, ::arrow::MemoryPool* pool);
+
+  /// \return Number of records read
+  int64_t ReadRecords(int64_t num_records);
+
+  int64_t records_read() const { return records_read_; }
+
+  int16_t* def_levels() { return reinterpret_cast<int16_t*>(def_levels_.mutable_data()); }
+
+  int16_t* rep_levels() { return reinterpret_cast<int16_t*>(rep_levels_.mutable_data()); }
+
+  int64_t levels_written() const { return num_decoded_values_; }
+
+  /// \brief Number of values written including nulls (if any)
+  int64_t values_written() const { return values_written_; }
+
+ private:
+  void Reset();
+  void Reserve(int64_t capacity);
+  void AdvanceWritten(int64_t levels_written, int64_t values_written);
+  void Advance(int64_t levels_consumed, int64_t values_consumed);
+
+  // Process written repetition/definition levels to reach the end of
+  // records. Process no more levels than necessary to delimit the indicated
+  // number of logical records. Updates internal state of RecordReader
+  //
+  // \return Number of records delimited
+  int64_t DelimitRecords(int64_t num_records, int64_t* values_seen);
+
+  void PopulateValues(int64_t values_to_read);
+
+  T* values() { return reinterpret_cast<T*>(values_.mutable_data()) + values_position_; }
+
+  const int max_def_level_;
+  const int max_rep_level_;
+
+  bool nullable_values_;
+
+  bool at_record_start_;
+  int64_t records_read_;
+
+  int64_t values_written_;
+  int64_t values_capacity_;
+  int64_t null_count_;
+
+  int64_t levels_position_;
+  int64_t levels_capacity_;
+
+  // TODO(wesm): ByteArray / FixedLenByteArray types
+  std::unique_ptr<::arrow::ArrayBuilder> builder_;
+
+  std::shared_ptr<::arrow::PoolBuffer> values_;
+  std::shared_ptr<::arrow::PoolBuffer> valid_bits_;
+  std::shared_ptr<::arrow::PoolBuffer> def_levels_;
+  std::shared_ptr<::arrow::PoolBuffer> rep_levels_;
 };
 
 typedef TypedColumnReader<BooleanType> BoolReader;
@@ -327,10 +314,9 @@ extern template class PARQUET_EXPORT TypedColumnReader<FLBAType>;
 namespace internal {
 
 void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
-                              int16_t max_definition_level,
-                              int16_t max_repetition_level, int64_t* values_read,
-                              int64_t* null_count, uint8_t* valid_bits,
-                              int64_t valid_bits_offset);
+                              int16_t max_definition_level, int16_t max_repetition_level,
+                              int64_t* values_read, int64_t* null_count,
+                              uint8_t* valid_bits, int64_t valid_bits_offset);
 
 }  // namespace internal
 
