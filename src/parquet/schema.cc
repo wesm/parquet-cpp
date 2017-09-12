@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <memory>
+#include <sstream>
+#include <string>
 
 #include "parquet/exception.h"
 #include "parquet/parquet_types.h"
@@ -704,6 +706,12 @@ int SchemaDescriptor::ColumnIndex(const Node& node) const {
 const schema::NodePtr& SchemaDescriptor::GetColumnRoot(int i) const {
   DCHECK(i >= 0 && i < static_cast<int>(leaves_.size()));
   return leaf_to_base_.find(i)->second;
+}
+
+std::string SchemaDescriptor::ToString() const {
+  std::ostringstream ss;
+  PrintSchema(schema_.get(), ss);
+  return ss.str();
 }
 
 int ColumnDescriptor::type_scale() const {

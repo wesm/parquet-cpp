@@ -402,6 +402,8 @@ class PARQUET_EXPORT SchemaDescriptor {
 
   const std::string& name() const { return group_node_->name(); }
 
+  std::string ToString() const;
+
  private:
   friend class ColumnDescriptor;
 
