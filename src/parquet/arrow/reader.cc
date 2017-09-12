@@ -24,11 +24,13 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/util/bit-util.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/parallel.h"
 
 #include "parquet/arrow/schema.h"
 #include "parquet/schema.h"
@@ -50,6 +52,7 @@ using parquet::schema::NodePtr;
 
 // Help reduce verbosity
 using ParquetReader = parquet::ParquetFileReader;
+using arrow::ParallelFor;
 
 namespace parquet {
 namespace arrow {
@@ -66,46 +69,16 @@ static inline int64_t impala_timestamp_to_nanoseconds(const Int96& impala_timest
 template <typename ArrowType>
 using ArrayType = typename ::arrow::TypeTraits<ArrowType>::ArrayType;
 
-// ----------------------------------------------------------------------
-// Helper for parallel for-loop
+template <typename ArrowType, typename ParquetType>
+struct supports_fast_path_impl {
+  using ArrowCType = typename ArrowType::c_type;
+  using ParquetCType = typename ParquetType::c_type;
+  static constexpr bool value = std::is_same<ArrowCType, ParquetCType>::value;
+};
 
-template <class FUNCTION>
-Status ParallelFor(int nthreads, int num_tasks, FUNCTION&& func) {
-  std::vector<std::thread> thread_pool;
-  thread_pool.reserve(nthreads);
-  std::atomic<int> task_counter(0);
-
-  std::mutex error_mtx;
-  bool error_occurred = false;
-  Status error;
-
-  for (int thread_id = 0; thread_id < nthreads; ++thread_id) {
-    thread_pool.emplace_back(
-        [&num_tasks, &task_counter, &error, &error_occurred, &error_mtx, &func]() {
-          int task_id;
-          while (!error_occurred) {
-            task_id = task_counter.fetch_add(1);
-            if (task_id >= num_tasks) {
-              break;
-            }
-            Status s = func(task_id);
-            if (!s.ok()) {
-              std::lock_guard<std::mutex> lock(error_mtx);
-              error_occurred = true;
-              error = s;
-              break;
-            }
-          }
-        });
-  }
-  for (auto&& thread : thread_pool) {
-    thread.join();
-  }
-  if (error_occurred) {
-    return error;
-  }
-  return Status::OK();
-}
+template <typename ArrowType, typename ParquetType>
+using supports_fast_path = typename std::enable_if<
+  supports_fast_path_impl<ArrowType, ParquetType>::value>::type;
 
 // ----------------------------------------------------------------------
 // Iteration utilities
@@ -242,9 +215,7 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::Impl {
       : pool_(pool),
         input_(std::move(input)),
         descr_(input_->descr()),
-        values_buffer_(pool),
-        def_levels_buffer_(pool),
-        rep_levels_buffer_(pool) {
+        buffer_(pool) {
     DCHECK(NodeToField(input_->descr()->schema_node(), &field_).ok());
     NextRowGroup();
   }
@@ -265,13 +236,15 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::Impl {
   template <typename ArrowType>
   Status InitDataBuffer(int batch_size);
   Status InitValidBits(int batch_size);
-  template <typename ArrowType, typename ParquetType>
-  Status ReadNullableBatch(TypedColumnReader<ParquetType>* reader, int16_t* def_levels,
-                           int16_t* rep_levels, int64_t values_to_read,
-                           int64_t* levels_read, int64_t* values_read);
-  template <typename ArrowType, typename ParquetType>
-  Status ReadNonNullableBatch(TypedColumnReader<ParquetType>* reader,
-                              int64_t values_to_read, int64_t* levels_read);
+
+  template <typename ArrowType, typename ParquetType, typename Enable = void>
+  Status ReadNullableBatch(int16_t* def_levels, int16_t* rep_levels,
+                           int64_t values_to_read, int64_t* levels_read,
+                           int64_t* values_read);
+
+  template <typename ArrowType, typename ParquetType, typename Enable = void>
+  Status ReadNonNullableBatch(int64_t values_to_read, int64_t* levels_read);
+
   Status WrapIntoListArray(const int16_t* def_levels, const int16_t* rep_levels,
                            int64_t total_values_read, std::shared_ptr<Array>* array);
 
@@ -298,9 +271,8 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::Impl {
   std::shared_ptr<::parquet::ColumnReader> column_reader_;
   std::shared_ptr<Field> field_;
 
-  PoolBuffer values_buffer_;
-  PoolBuffer def_levels_buffer_;
-  PoolBuffer rep_levels_buffer_;
+  ColumnDecodeBuffer buffer_;
+
   std::shared_ptr<PoolBuffer> data_buffer_;
   uint8_t* data_buffer_ptr_;
   std::shared_ptr<PoolBuffer> valid_bits_buffer_;
@@ -646,11 +618,13 @@ const ParquetFileReader* FileReader::parquet_reader() const {
   return impl_->parquet_reader();
 }
 
-template <typename ArrowType, typename ParquetType>
-Status PrimitiveImpl::ReadNonNullableBatch(TypedColumnReader<ParquetType>* reader,
-                                           int64_t values_to_read, int64_t* levels_read) {
+template <typename ArrowType, typename ParquetType, typename Enable = void>
+Status PrimitiveImpl::ReadNonNullableBatch(int64_t values_to_read, int64_t* levels_read) {
   using ArrowCType = typename ArrowType::c_type;
   using ParquetCType = typename ParquetType::c_type;
+
+  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
 
   RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(ParquetCType), false));
   auto values = reinterpret_cast<ParquetCType*>(values_buffer_.mutable_data());
@@ -666,34 +640,31 @@ Status PrimitiveImpl::ReadNonNullableBatch(TypedColumnReader<ParquetType>* reade
   return Status::OK();
 }
 
-#define NONNULLABLE_BATCH_FAST_PATH(ArrowType, ParquetType, CType)               \
-  template <>                                                                    \
-  Status PrimitiveImpl::ReadNonNullableBatch<ArrowType, ParquetType>(            \
-      TypedColumnReader<ParquetType> * reader, int64_t values_to_read,           \
-      int64_t * levels_read) {                                                   \
-    int64_t values_read;                                                         \
-    CType* out_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);                 \
-    PARQUET_CATCH_NOT_OK(*levels_read = reader->ReadBatch(                       \
-                             static_cast<int>(values_to_read), nullptr, nullptr, \
-                             out_ptr + valid_bits_idx_, &values_read));          \
-                                                                                 \
-    valid_bits_idx_ += values_read;                                              \
-                                                                                 \
-    return Status::OK();                                                         \
-  }
+template <typename ArrowType, typename ParquetType>
+Status PrimitiveImpl::ReadNonNullableBatch<
+  ArrowType, ParquetType, supports_fast_path<ArrowType, ParquetType>>(
+      int64_t values_to_read,
+      int64_t * levels_read) {
+  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
 
-NONNULLABLE_BATCH_FAST_PATH(::arrow::Int32Type, Int32Type, int32_t)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::Int64Type, Int64Type, int64_t)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::FloatType, FloatType, float)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::DoubleType, DoubleType, double)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::Date32Type, Int32Type, int32_t)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::TimestampType, Int64Type, int64_t)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::Time32Type, Int32Type, int32_t)
-NONNULLABLE_BATCH_FAST_PATH(::arrow::Time64Type, Int64Type, int64_t)
+  int64_t values_read;
+  CType* out_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);
+  PARQUET_CATCH_NOT_OK(*levels_read = reader->ReadBatch(
+      static_cast<int>(values_to_read), nullptr, nullptr,
+      out_ptr + valid_bits_idx_, &values_read));
+
+  valid_bits_idx_ += values_read;
+
+  return Status::OK();
+}
 
 template <>
 Status PrimitiveImpl::ReadNonNullableBatch<::arrow::TimestampType, Int96Type>(
-    TypedColumnReader<Int96Type>* reader, int64_t values_to_read, int64_t* levels_read) {
+    int64_t values_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<TypedColumnReader<Int96Type>*>(column_reader_.get());
+  DCHECK(reader);
+
   RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(Int96), false));
   auto values = reinterpret_cast<Int96*>(values_buffer_.mutable_data());
   int64_t values_read;
@@ -712,7 +683,10 @@ Status PrimitiveImpl::ReadNonNullableBatch<::arrow::TimestampType, Int96Type>(
 
 template <>
 Status PrimitiveImpl::ReadNonNullableBatch<::arrow::Date64Type, Int32Type>(
-    TypedColumnReader<Int32Type>* reader, int64_t values_to_read, int64_t* levels_read) {
+    int64_t values_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<TypedColumnReader<Int32Type>*>(column_reader_.get());
+  DCHECK(reader);
+
   RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(int32_t), false));
   auto values = reinterpret_cast<int32_t*>(values_buffer_.mutable_data());
   int64_t values_read;
@@ -731,8 +705,10 @@ Status PrimitiveImpl::ReadNonNullableBatch<::arrow::Date64Type, Int32Type>(
 
 template <>
 Status PrimitiveImpl::ReadNonNullableBatch<::arrow::BooleanType, BooleanType>(
-    TypedColumnReader<BooleanType>* reader, int64_t values_to_read,
-    int64_t* levels_read) {
+    int64_t values_to_read, int64_t* levels_read) {
+  auto reader = dynamic_cast<TypedColumnReader<BooleanType>*>(column_reader_.get());
+  DCHECK(reader);
+
   RETURN_NOT_OK(values_buffer_.Resize(values_to_read * sizeof(bool), false));
   auto values = reinterpret_cast<bool*>(values_buffer_.mutable_data());
   int64_t values_read;
@@ -751,10 +727,14 @@ Status PrimitiveImpl::ReadNonNullableBatch<::arrow::BooleanType, BooleanType>(
 }
 
 template <typename ArrowType, typename ParquetType>
-Status PrimitiveImpl::ReadNullableBatch(TypedColumnReader<ParquetType>* reader,
-                                        int16_t* def_levels, int16_t* rep_levels,
-                                        int64_t values_to_read, int64_t* levels_read,
+  Status PrimitiveImpl::ReadNullableBatch<
+      ArrowType, ParquetType,
+       supports_fast_path<ArrowType, ParquetType>>(int16_t* def_levels, int16_t* rep_levels,
+  int64_t values_to_read, int64_t* levels_read,
                                         int64_t* values_read) {
+  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
+
   using ArrowCType = typename ArrowType::c_type;
   using ParquetCType = typename ParquetType::c_type;
 
@@ -780,33 +760,27 @@ Status PrimitiveImpl::ReadNullableBatch(TypedColumnReader<ParquetType>* reader,
   return Status::OK();
 }
 
-#define NULLABLE_BATCH_FAST_PATH(ArrowType, ParquetType, CType)                    \
-  template <>                                                                      \
-  Status PrimitiveImpl::ReadNullableBatch<ArrowType, ParquetType>(                 \
-      TypedColumnReader<ParquetType> * reader, int16_t * def_levels,               \
-      int16_t * rep_levels, int64_t values_to_read, int64_t * levels_read,         \
-      int64_t * values_read) {                                                     \
-    auto data_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);                    \
-    int64_t null_count;                                                            \
-    PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(                                  \
-        static_cast<int>(values_to_read), def_levels, rep_levels,                  \
-        data_ptr + valid_bits_idx_, valid_bits_ptr_, valid_bits_idx_, levels_read, \
-        values_read, &null_count));                                                \
-                                                                                   \
-    valid_bits_idx_ += *values_read;                                               \
-    null_count_ += null_count;                                                     \
-                                                                                   \
-    return Status::OK();                                                           \
-  }
+template <typename ArrowType, typename ParquetType>
+Status PrimitiveImpl::ReadNullableBatch<
+  ArrowType, ParquetType
+  supports_fast_path<ArrowType, ParquetType>>(
+    int16_t * def_levels, int16_t * rep_levels, int64_t values_to_read,
+int64_t * levels_read, int64_t * values_read) {
+  auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
+  DCHECK(reader);
 
-NULLABLE_BATCH_FAST_PATH(::arrow::Int32Type, Int32Type, int32_t)
-NULLABLE_BATCH_FAST_PATH(::arrow::Int64Type, Int64Type, int64_t)
-NULLABLE_BATCH_FAST_PATH(::arrow::FloatType, FloatType, float)
-NULLABLE_BATCH_FAST_PATH(::arrow::DoubleType, DoubleType, double)
-NULLABLE_BATCH_FAST_PATH(::arrow::Date32Type, Int32Type, int32_t)
-NULLABLE_BATCH_FAST_PATH(::arrow::TimestampType, Int64Type, int64_t)
-NULLABLE_BATCH_FAST_PATH(::arrow::Time32Type, Int32Type, int32_t)
-NULLABLE_BATCH_FAST_PATH(::arrow::Time64Type, Int64Type, int64_t)
+  auto data_ptr = reinterpret_cast<CType*>(data_buffer_ptr_);
+  int64_t null_count;
+  PARQUET_CATCH_NOT_OK(reader->ReadBatchSpaced(
+      static_cast<int>(values_to_read), def_levels, rep_levels,
+      data_ptr + valid_bits_idx_, valid_bits_ptr_, valid_bits_idx_, levels_read,
+      values_read, &null_count));
+
+  valid_bits_idx_ += *values_read;
+  null_count_ += null_count;
+
+  return Status::OK();
+}
 
 template <>
 Status PrimitiveImpl::ReadNullableBatch<::arrow::TimestampType, Int96Type>(
@@ -1043,14 +1017,8 @@ Status PrimitiveImpl::TypedReadBatch(int batch_size, std::shared_ptr<Array>* out
   int total_levels_read = 0;
   RETURN_NOT_OK(InitDataBuffer<ArrowType>(batch_size));
   RETURN_NOT_OK(InitValidBits(batch_size));
-  if (descr_->max_definition_level() > 0) {
-    RETURN_NOT_OK(def_levels_buffer_.Resize(batch_size * sizeof(int16_t), false));
-  }
-  if (descr_->max_repetition_level() > 0) {
-    RETURN_NOT_OK(rep_levels_buffer_.Resize(batch_size * sizeof(int16_t), false));
-  }
-  int16_t* def_levels = reinterpret_cast<int16_t*>(def_levels_buffer_.mutable_data());
-  int16_t* rep_levels = reinterpret_cast<int16_t*>(rep_levels_buffer_.mutable_data());
+
+  RETURN_NOT_OK(buffer_.Reserve(descr_, batch_size));
 
   while ((values_to_read > 0) && column_reader_) {
     auto reader = dynamic_cast<TypedColumnReader<ParquetType>*>(column_reader_.get());
@@ -1060,6 +1028,9 @@ Status PrimitiveImpl::TypedReadBatch(int batch_size, std::shared_ptr<Array>* out
       RETURN_NOT_OK((ReadNonNullableBatch<ArrowType, ParquetType>(reader, values_to_read,
                                                                   &values_read)));
     } else {
+      int16_t* def_levels = buffer_.def_levels();
+      int16_t* rep_levels = buffer_.rep_levels();
+
       // As per the defintion and checks for flat (list) columns:
       // descr_->max_definition_level() > 0, <= 3
       RETURN_NOT_OK((ReadNullableBatch<ArrowType, ParquetType>(
