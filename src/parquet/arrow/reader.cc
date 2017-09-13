@@ -215,9 +215,6 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
 
   Status NextBatch(int records_to_read, std::shared_ptr<Array>* out) override;
 
-  template <typename ArrowType, typename ParquetType>
-  Status TypedReadBatch(int64_t records_to_read, std::shared_ptr<Array>* out);
-
   template <typename ParquetType>
   Status WrapIntoListArray(std::shared_ptr<Array>* array);
 
@@ -266,8 +263,7 @@ class PARQUET_NO_EXPORT StructImpl : public ColumnReader::ColumnReaderImpl {
   std::shared_ptr<Field> field_;
   PoolBuffer def_levels_buffer_;
 
-  Status DefLevelsToNullArray(std::shared_ptr<Buffer>* null_bitmap,
-                              int64_t* null_count);
+  Status DefLevelsToNullArray(std::shared_ptr<Buffer>* null_bitmap, int64_t* null_count);
   void InitField(const Node* node,
                  const std::vector<std::shared_ptr<ColumnReaderImpl>>& children);
 };
@@ -873,9 +869,28 @@ struct TransferFunctor<
   }
 };
 
-template <typename ArrowType, typename ParquetType>
-Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
-                                     std::shared_ptr<Array>* out) {
+#define TRANSFER_DATA(ArrowType, ParquetType)                            \
+  TransferFunctor<ArrowType, ParquetType> func;                          \
+  RETURN_NOT_OK(func(record_reader_.get(), pool_, field_->type(), out)); \
+  RETURN_NOT_OK(WrapIntoListArray<ParquetType>(out))
+
+#define TYPED_BATCH_CASE(ENUM, ArrowType, ParquetType) \
+  case ::arrow::Type::ENUM: {                          \
+    TRANSFER_DATA(ArrowType, ParquetType);             \
+  } break;
+
+Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
+  if (!column_reader_) {
+    // Exhausted all row groups.
+    *out = nullptr;
+    return Status::OK();
+  }
+
+  if (field_->type()->id() == ::arrow::Type::NA) {
+    *out = std::make_shared<::arrow::NullArray>(records_to_read);
+    return Status::OK();
+  }
+
   PARQUET_CATCH_NOT_OK(record_reader_->Reset());
   PARQUET_CATCH_NOT_OK(record_reader_->Reserve(records_to_read));
 
@@ -892,60 +907,34 @@ Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
     }
   }
 
-  TransferFunctor<ArrowType, ParquetType> func;
-  RETURN_NOT_OK(func(record_reader_.get(), pool_, field_->type(), out));
-
-  // Check if we should transform this array into an list array.
-  RETURN_NOT_OK(WrapIntoListArray<ParquetType>(out));
-  return Status::OK();
-}
-
-#define TYPED_BATCH_CASE(ENUM, ArrowType, ParquetType)                   \
-  case ::arrow::Type::ENUM:                                              \
-    return TypedReadBatch<ArrowType, ParquetType>(records_to_read, out); \
-    break;
-
-Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
-  if (!column_reader_) {
-    // Exhausted all row groups.
-    *out = nullptr;
-    return Status::OK();
-  }
-
   switch (field_->type()->id()) {
-    case ::arrow::Type::NA:
-      *out = std::make_shared<::arrow::NullArray>(records_to_read);
-      return Status::OK();
-      break;
-      TYPED_BATCH_CASE(BOOL, ::arrow::BooleanType, BooleanType)
-      TYPED_BATCH_CASE(UINT8, ::arrow::UInt8Type, Int32Type)
-      TYPED_BATCH_CASE(INT8, ::arrow::Int8Type, Int32Type)
-      TYPED_BATCH_CASE(UINT16, ::arrow::UInt16Type, Int32Type)
-      TYPED_BATCH_CASE(INT16, ::arrow::Int16Type, Int32Type)
-      TYPED_BATCH_CASE(UINT32, ::arrow::UInt32Type, Int32Type)
-      TYPED_BATCH_CASE(INT32, ::arrow::Int32Type, Int32Type)
-      TYPED_BATCH_CASE(UINT64, ::arrow::UInt64Type, Int64Type)
-      TYPED_BATCH_CASE(INT64, ::arrow::Int64Type, Int64Type)
-      TYPED_BATCH_CASE(FLOAT, ::arrow::FloatType, FloatType)
-      TYPED_BATCH_CASE(DOUBLE, ::arrow::DoubleType, DoubleType)
-      TYPED_BATCH_CASE(STRING, ::arrow::StringType, ByteArrayType)
-      TYPED_BATCH_CASE(BINARY, ::arrow::BinaryType, ByteArrayType)
-      TYPED_BATCH_CASE(DATE32, ::arrow::Date32Type, Int32Type)
-      TYPED_BATCH_CASE(DATE64, ::arrow::Date64Type, Int32Type)
-      TYPED_BATCH_CASE(FIXED_SIZE_BINARY, ::arrow::FixedSizeBinaryType, FLBAType)
+    TYPED_BATCH_CASE(BOOL, ::arrow::BooleanType, BooleanType)
+    TYPED_BATCH_CASE(UINT8, ::arrow::UInt8Type, Int32Type)
+    TYPED_BATCH_CASE(INT8, ::arrow::Int8Type, Int32Type)
+    TYPED_BATCH_CASE(UINT16, ::arrow::UInt16Type, Int32Type)
+    TYPED_BATCH_CASE(INT16, ::arrow::Int16Type, Int32Type)
+    TYPED_BATCH_CASE(UINT32, ::arrow::UInt32Type, Int32Type)
+    TYPED_BATCH_CASE(INT32, ::arrow::Int32Type, Int32Type)
+    TYPED_BATCH_CASE(UINT64, ::arrow::UInt64Type, Int64Type)
+    TYPED_BATCH_CASE(INT64, ::arrow::Int64Type, Int64Type)
+    TYPED_BATCH_CASE(FLOAT, ::arrow::FloatType, FloatType)
+    TYPED_BATCH_CASE(DOUBLE, ::arrow::DoubleType, DoubleType)
+    TYPED_BATCH_CASE(STRING, ::arrow::StringType, ByteArrayType)
+    TYPED_BATCH_CASE(BINARY, ::arrow::BinaryType, ByteArrayType)
+    TYPED_BATCH_CASE(DATE32, ::arrow::Date32Type, Int32Type)
+    TYPED_BATCH_CASE(DATE64, ::arrow::Date64Type, Int32Type)
+    TYPED_BATCH_CASE(FIXED_SIZE_BINARY, ::arrow::FixedSizeBinaryType, FLBAType)
     case ::arrow::Type::TIMESTAMP: {
       ::arrow::TimestampType* timestamp_type =
           static_cast<::arrow::TimestampType*>(field_->type().get());
       switch (timestamp_type->unit()) {
         case ::arrow::TimeUnit::MILLI:
-          return TypedReadBatch<::arrow::TimestampType, Int64Type>(records_to_read, out);
-          break;
-        case ::arrow::TimeUnit::MICRO:
-          return TypedReadBatch<::arrow::TimestampType, Int64Type>(records_to_read, out);
-          break;
-        case ::arrow::TimeUnit::NANO:
-          return TypedReadBatch<::arrow::TimestampType, Int96Type>(records_to_read, out);
-          break;
+        case ::arrow::TimeUnit::MICRO: {
+          TRANSFER_DATA(::arrow::TimestampType, Int64Type);
+        } break;
+        case ::arrow::TimeUnit::NANO: {
+          TRANSFER_DATA(::arrow::TimestampType, Int96Type);
+        } break;
         default:
           return Status::NotImplemented("TimeUnit not supported");
       }
@@ -958,6 +947,7 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
       ss << "No support for reading columns of type " << field_->type()->ToString();
       return Status::NotImplemented(ss.str());
   }
+  return Status::OK();
 }
 
 void PrimitiveImpl::NextRowGroup() { column_reader_ = input_->Next(); }
