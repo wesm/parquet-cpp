@@ -330,21 +330,27 @@ inline int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size,
 
 namespace internal {
 
+// TODO(itaiin): another code path split to merge when the general case is done
 static inline bool HasSpacedValues(const ColumnDescriptor* descr) {
   // True if the node is nullable, or if it's contained in a nullable group
   // prior to the previous repeated node
-
-  const schema::Node* node = descr->schema_node().get();
-
-  while (node) {
-    if (node->is_optional()) {
-      return true;
-    } else if (node->is_repeated()) {
-      return false;
+  if (descr->max_repetition_level() > 0) {
+    // repeated+flat case
+    return !descr->schema_node()->is_required();
+  } else {
+    // non-repeated+nested case
+    // Find if a node forces nulls in the lowest level along the hierarchy
+    const schema::Node* node = descr->schema_node().get();
+    while (node) {
+      auto parent = node->parent();
+      if (node->is_optional()) {
+        return true;
+        break;
+      }
+      node = parent;
     }
-    node = node->parent();
+    return false;
   }
-  return false;
 }
 
 }  // namespace internal
@@ -379,7 +385,6 @@ inline int64_t TypedColumnReader<DType>::ReadBatchSpaced(
       }
     }
 
-    // TODO(itaiin): another code path split to merge when the general case is done
     bool has_spaced_values = internal::HasSpacedValues(descr_);
 
     int64_t null_count = 0;
