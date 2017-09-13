@@ -351,7 +351,7 @@ RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
       levels_written_(0),
       levels_position_(0),
       levels_capacity_(0) {
-  nullable_values_ = !descr->schema_node()->is_required();
+  nullable_values_ = internal::HasSpacedValues(descr);
   values_ = std::make_shared<PoolBuffer>(pool);
   valid_bits_ = std::make_shared<PoolBuffer>(pool);
   def_levels_ = std::make_shared<PoolBuffer>(pool);
@@ -697,12 +697,14 @@ void RecordReader::Reset() {
 }
 
 void RecordReader::ResetValues() {
-  // Resize to 0, but do not shrink to fit
-  PARQUET_THROW_NOT_OK(values_->Resize(0, false));
-  PARQUET_THROW_NOT_OK(valid_bits_->Resize(0, false));
-  values_written_ = 0;
-  values_capacity_ = 0;
-  null_count_ = 0;
+  if (values_written_ > 0) {
+    // Resize to 0, but do not shrink to fit
+    PARQUET_THROW_NOT_OK(values_->Resize(0, false));
+    PARQUET_THROW_NOT_OK(valid_bits_->Resize(0, false));
+    values_written_ = 0;
+    values_capacity_ = 0;
+    null_count_ = 0;
+  }
 }
 
 // ----------------------------------------------------------------------

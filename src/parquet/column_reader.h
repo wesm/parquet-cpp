@@ -36,7 +36,6 @@
 #include "parquet/exception.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
-#include "parquet/util/logging.h"
 #include "parquet/util/memory.h"
 #include "parquet/util/visibility.h"
 
@@ -118,13 +117,7 @@ class PARQUET_EXPORT ColumnReader {
     return num_buffered_values_ - num_decoded_values_;
   }
 
-  void ConsumeBufferedValues(int64_t num_values) {
-    num_decoded_values_ += num_values;
-    if (num_decoded_values_ > num_buffered_values_) {
-      DCHECK(false);
-    }
-    DCHECK_LE(num_decoded_values_, num_buffered_values_);
-  }
+  void ConsumeBufferedValues(int64_t num_values) { num_decoded_values_ += num_values; }
 
   const ColumnDescriptor* descr_;
 
@@ -335,6 +328,27 @@ inline int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size,
   return total_values;
 }
 
+namespace internal {
+
+static inline bool HasSpacedValues(const ColumnDescriptor* descr) {
+  // True if the node is nullable, or if it's contained in a nullable group
+  // prior to the previous repeated node
+
+  const schema::Node* node = descr->schema_node().get();
+
+  while (node) {
+    if (node->is_optional()) {
+      return true;
+    } else if (node->is_repeated()) {
+      return false;
+    }
+    node = node->parent();
+  }
+  return false;
+}
+
+}  // namespace internal
+
 template <typename DType>
 inline int64_t TypedColumnReader<DType>::ReadBatchSpaced(
     int64_t batch_size, int16_t* def_levels, int16_t* rep_levels, T* values,
@@ -366,24 +380,7 @@ inline int64_t TypedColumnReader<DType>::ReadBatchSpaced(
     }
 
     // TODO(itaiin): another code path split to merge when the general case is done
-    bool has_spaced_values;
-    if (descr_->max_repetition_level() > 0) {
-      // repeated+flat case
-      has_spaced_values = !descr_->schema_node()->is_required();
-    } else {
-      // non-repeated+nested case
-      // Find if a node forces nulls in the lowest level along the hierarchy
-      const schema::Node* node = descr_->schema_node().get();
-      has_spaced_values = false;
-      while (node) {
-        auto parent = node->parent();
-        if (node->is_optional()) {
-          has_spaced_values = true;
-          break;
-        }
-        node = parent;
-      }
-    }
+    bool has_spaced_values = internal::HasSpacedValues(descr_);
 
     int64_t null_count = 0;
     if (!has_spaced_values) {
@@ -492,13 +489,10 @@ class PARQUET_EXPORT RecordReader {
 
   bool nullable_values() const { return nullable_values_; }
 
-  int64_t records_read() const { return records_read_; }
-
   int64_t ReadRecords(ColumnReader* reader, int64_t num_records);
 
   void Reset();
   void Reserve(int64_t capacity);
-  void ResetValues();
 
   // Returns number of records scanned
   int64_t ScanRecords(ColumnReader* reader, int64_t num_records);
@@ -541,6 +535,8 @@ class PARQUET_EXPORT RecordReader {
   std::unique_ptr<::arrow::ArrayBuilder> builder_;
 
   std::shared_ptr<::arrow::PoolBuffer> values_;
+
+  void ResetValues();
 
   template <typename T>
   T* ValuesHead() {

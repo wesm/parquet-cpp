@@ -703,9 +703,9 @@ int SchemaDescriptor::ColumnIndex(const Node& node) const {
   return result;
 }
 
-const schema::NodePtr& SchemaDescriptor::GetColumnRoot(int i) const {
+const schema::Node* SchemaDescriptor::GetColumnRoot(int i) const {
   DCHECK(i >= 0 && i < static_cast<int>(leaves_.size()));
-  return leaf_to_base_.find(i)->second;
+  return leaf_to_base_.find(i)->second.get();
 }
 
 std::string SchemaDescriptor::ToString() const {
