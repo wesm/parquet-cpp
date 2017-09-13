@@ -207,6 +207,8 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
       : pool_(pool), input_(std::move(input)), descr_(input_->descr()) {
     DCHECK(NodeToField(input_->descr()->schema_node(), &field_).ok());
     NextRowGroup();
+
+    record_reader_.reset(new RecordReader(descr_, pool_));
   }
 
   virtual ~PrimitiveImpl() {}
@@ -869,7 +871,10 @@ Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
     if (!column_reader_) {
       break;
     }
-    records_to_read -= record_reader_->ReadRecords(column_reader_.get(), records_to_read);
+
+    int64_t records_read = record_reader_->ReadRecords(column_reader_.get(),
+                                                       records_to_read);
+    records_to_read -= records_read;
     if (!column_reader_->HasNext()) {
       NextRowGroup();
     }

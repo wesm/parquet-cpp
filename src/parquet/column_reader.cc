@@ -342,7 +342,15 @@ RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
     : descr_(descr),
       pool_(pool),
       max_def_level_(descr->max_definition_level()),
-      max_rep_level_(descr->max_repetition_level()) {
+      max_rep_level_(descr->max_repetition_level()),
+      at_record_start_(false),
+      records_read_(0),
+      values_written_(0),
+      values_capacity_(0),
+      null_count_(0),
+      levels_written_(0),
+      levels_position_(0),
+      levels_capacity_(0) {
   nullable_values_ = !descr->schema_node()->is_required();
   values_ = std::make_shared<PoolBuffer>(pool);
   valid_bits_ = std::make_shared<PoolBuffer>(pool);
@@ -356,7 +364,6 @@ RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
     std::shared_ptr<::arrow::DataType> type = ::arrow::fixed_size_binary(byte_width);
     builder_.reset(new ::arrow::FixedSizeBinaryBuilder(type, pool));
   }
-
   Reset();
 }
 
@@ -473,10 +480,8 @@ int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) 
         ++records_read;
       }
     } else {
-      int64_t num_values = levels_written_ - levels_position_;
-      values_to_read += num_values;
-      records_read += num_values;
-      levels_position_ += num_values;
+      values_to_read = num_records;
+      records_read = num_records;
     }
   }
   *values_seen = values_to_read;
@@ -617,14 +622,16 @@ void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read
 }
 
 void RecordReader::Reserve(int64_t capacity) {
-  if (levels_written_ + capacity > levels_capacity_) {
+  if (descr_->max_definition_level() > 0 &&
+      (levels_written_ + capacity > levels_capacity_)) {
     int64_t new_levels_capacity = BitUtil::NextPower2(levels_capacity_ + 1);
     while (levels_written_ + capacity > new_levels_capacity) {
       new_levels_capacity = BitUtil::NextPower2(new_levels_capacity + 1);
     }
-    if (descr_->max_definition_level() > 0) {
-      PARQUET_THROW_NOT_OK(
-          def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
+    PARQUET_THROW_NOT_OK(
+        def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
+
+    if (nullable_values_) {
       PARQUET_THROW_NOT_OK(
           valid_bits_->Resize(BitUtil::BytesForBits(new_levels_capacity), false));
     }
@@ -650,25 +657,26 @@ void RecordReader::Reserve(int64_t capacity) {
 void RecordReader::Reset() {
   ResetValues();
 
-  const int64_t levels_remaining = levels_written_ - levels_position_;
+  if (levels_written_ > 0) {
+    const int64_t levels_remaining = levels_written_ - levels_position_;
+    // Shift remaining levels to beginning of buffer and trim to only the number
+    // of decoded levels remaining
+    int16_t* def_data = def_levels();
+    int16_t* rep_data = rep_levels();
 
-  // Shift remaining levels to beginning of buffer and trim to only the number
-  // of decoded levels remaining
-  int16_t* def_data = def_levels();
-  int16_t* rep_data = rep_levels();
+    std::copy(def_data + levels_position_, def_data + levels_written_, def_data);
+    std::copy(rep_data + levels_position_, rep_data + levels_written_, rep_data);
 
-  std::copy(def_data + levels_position_, def_data + levels_written_, def_data);
-  std::copy(rep_data + levels_position_, rep_data + levels_written_, rep_data);
+    PARQUET_THROW_NOT_OK(def_levels_->Resize(levels_remaining * sizeof(int16_t), false));
+    PARQUET_THROW_NOT_OK(rep_levels_->Resize(levels_remaining * sizeof(int16_t), false));
 
-  PARQUET_THROW_NOT_OK(def_levels_->Resize(levels_remaining * sizeof(int16_t), false));
-  PARQUET_THROW_NOT_OK(rep_levels_->Resize(levels_remaining * sizeof(int16_t), false));
+    levels_written_ -= levels_position_;
+    levels_position_ = 0;
+    levels_capacity_ = levels_remaining;
+  }
 
   at_record_start_ = false;
   records_read_ = 0;
-
-  levels_written_ -= levels_position_;
-  levels_position_ = 0;
-  levels_capacity_ = levels_remaining;
 
   // Calling Finish on the builders also resets them
 }
