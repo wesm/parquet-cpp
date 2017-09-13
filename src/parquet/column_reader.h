@@ -261,24 +261,24 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
 // Type column reader implementations
 
 template <typename DType>
-int64_t TypedColumnReader<DType>::ReadValues(int64_t batch_size, T* out) {
+inline int64_t TypedColumnReader<DType>::ReadValues(int64_t batch_size, T* out) {
   int64_t num_decoded = current_decoder_->Decode(out, static_cast<int>(batch_size));
   return num_decoded;
 }
 
 template <typename DType>
-int64_t TypedColumnReader<DType>::ReadValuesSpaced(int64_t batch_size, T* out,
-                                                   int64_t null_count,
-                                                   uint8_t* valid_bits,
-                                                   int64_t valid_bits_offset) {
+inline int64_t TypedColumnReader<DType>::ReadValuesSpaced(int64_t batch_size, T* out,
+                                                          int64_t null_count,
+                                                          uint8_t* valid_bits,
+                                                          int64_t valid_bits_offset) {
   return current_decoder_->DecodeSpaced(out, static_cast<int>(batch_size), null_count,
                                         valid_bits, valid_bits_offset);
 }
 
 template <typename DType>
-int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size, int16_t* def_levels,
-                                            int16_t* rep_levels, T* values,
-                                            int64_t* values_read) {
+inline int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size, int16_t* def_levels,
+                                                   int16_t* rep_levels, T* values,
+                                                   int64_t* values_read) {
   // HasNext invokes ReadNewPage
   if (!HasNext()) {
     *values_read = 0;
@@ -325,10 +325,10 @@ int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size, int16_t* def_lev
 }
 
 template <typename DType>
-int64_t TypedColumnReader<DType>::ReadBatchSpaced(
-    int64_t batch_size, int16_t* def_levels, int16_t* rep_levels, T* values,
-    uint8_t* valid_bits, int64_t valid_bits_offset, int64_t* levels_read,
-    int64_t* values_read, int64_t* null_count_out) {
+inline int64_t TypedColumnReader<DType>::ReadBatchSpaced(
+    int64_t batch_size, int16_t* def_levels, int16_t* rep_levels,
+    T* values, uint8_t* valid_bits, int64_t valid_bits_offset,
+    int64_t* levels_read, int64_t* values_read, int64_t* null_count_out) {
   // HasNext invokes ReadNewPage
   if (!HasNext()) {
     *levels_read = 0;
