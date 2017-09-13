@@ -1286,7 +1286,7 @@ TEST(TestArrowReadWrite, ReadSingleRowGroup) {
   std::shared_ptr<Table> concatenated;
   ASSERT_OK(ConcatenateTables({r1, r2}, &concatenated));
 
-  AssertTablesEqual(*table, *concatenated);
+  ASSERT_TRUE(table->Equals(*concatenated));
 }
 
 TEST(TestArrowReadWrite, ScanContents) {
