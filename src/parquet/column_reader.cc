@@ -438,7 +438,7 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
         this->def_levels() + start_levels_position,
         levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
         &implied_values_read, &null_count, valid_bits, valid_bits_offset);
-    ReadValuesSpaced(reader, values_to_read, null_count);
+    ReadValuesSpaced(reader, values_to_read + null_count, null_count);
   } else {
     ReadValues(reader, values_to_read);
   }
@@ -488,8 +488,6 @@ int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) 
 }
 
 void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
-  uint8_t* valid_bits = valid_bits_->mutable_data();
-  const int64_t valid_bits_offset = values_written_;
   int64_t actual_read = 0;
 
 #define READ_PRIMITIVE(PARQUET_TYPE)                                               \
@@ -498,9 +496,6 @@ void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
     auto values =                                                                  \
         reinterpret_cast<typename PARQUET_TYPE::c_type*>(values_->mutable_data()); \
     actual_read = typed_reader->ReadValues(values_to_read, values);                \
-    for (int64_t i = 0; i < values_to_read; i++) {                                 \
-      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);                 \
-    }                                                                              \
   }
 
   switch (descr_->physical_type()) {
@@ -617,6 +612,8 @@ void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read
       ResetValues();
     } break;
   }
+#undef READ_PRIMITIVE
+
   DCHECK_EQ(actual_read, values_to_read);
 }
 
@@ -629,14 +626,21 @@ void RecordReader::Reserve(int64_t capacity) {
     }
     PARQUET_THROW_NOT_OK(
         def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
+    memset(def_levels_->mutable_data() + levels_written_ * sizeof(int16_t), 0,
+           (new_levels_capacity - levels_written_) * sizeof(int16_t));
 
     if (nullable_values_) {
-      PARQUET_THROW_NOT_OK(
-          valid_bits_->Resize(BitUtil::BytesForBits(new_levels_capacity), false));
+      int64_t nbytes_old = BitUtil::BytesForBits(levels_written_);
+      int64_t nbytes_new = BitUtil::BytesForBits(new_levels_capacity);
+      PARQUET_THROW_NOT_OK(valid_bits_->Resize(nbytes_new, false));
+      memset(valid_bits_->mutable_data() + nbytes_old * sizeof(int16_t), 0,
+             (nbytes_new - nbytes_old) * sizeof(int16_t));
     }
     if (descr_->max_repetition_level() > 0) {
       PARQUET_THROW_NOT_OK(
           rep_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
+      memset(rep_levels_->mutable_data() + levels_written_ * sizeof(int16_t), 0,
+             (new_levels_capacity - levels_written_) * sizeof(int16_t));
     }
     levels_capacity_ = new_levels_capacity;
   }
@@ -648,7 +652,8 @@ void RecordReader::Reserve(int64_t capacity) {
 
     int type_size = GetTypeByteSize(descr_->physical_type());
     PARQUET_THROW_NOT_OK(values_->Resize(new_values_capacity * type_size, false));
-
+    memset(values_->mutable_data() + values_written_ * type_size, 0,
+           (new_values_capacity - values_written_) * type_size);
     values_capacity_ = new_values_capacity;
   }
 }
