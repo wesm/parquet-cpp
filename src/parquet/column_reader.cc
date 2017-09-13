@@ -544,13 +544,18 @@ void RecordReader<DType>::RecordReader(const ColumnDescriptor* descr,
 }
 
 template <typename DType>
-void RecordReader<DType>::Reset() {
+void RecordReader<DType>::ResetValues() {
   // Resize to 0, but do not shrink to fit
   PARQUET_THROW_NOT_OK(values_.Resize(0, false));
   PARQUET_THROW_NOT_OK(valid_bits_.Resize(0, false));
   values_written_ = 0;
   values_capacity_ = 0;
   null_count_ = 0;
+}
+
+template <typename DType>
+void RecordReader<DType>::ConsumeRecords() {
+  ResetValues();
 
   const int64_t levels_remaining = levels_written_ - levels_position_;
 
@@ -595,24 +600,6 @@ void RecordReader::Reserve(int64_t capacity) {
 
   values_capacity_ = new_values_capacity;
   levels_capacity_ = new_levels_capacity;
-}
-
-template <typename DType>
-void RecordReader<DType>::AdvanceWritten(int64_t levels_written, int64_t values_written) {
-
-}
-
-template <typename DType>
-void RecordReader<DType>::Advance(int64_t levels_consumed, int64_t values_consumed) {
-  levels_position_ += levels_consumed;
-  if (levels_position_ == levels_written_) {
-    levels_position_ = 0;
-  }
-
-  values_position_ += values_consumed;
-  if (values_position_ == values_written_) {
-    values_position_ = 0;
-  }
 }
 
 template <typename DType>
@@ -711,11 +698,15 @@ int64_t RecordReader<DType>::ReadRecords(int64_t num_records) {
   return records_read;
 }
 
-template <typename DType>
-void RecordReader<DType>::PopulateValues(int64_t values_to_read,
-                                         int64_t start_level_position) {
+template <>
+void RecordReader<ByteArrayType>::PopulateValues(int64_t values_to_read,
+                                                 int64_t start_level_position) {
   int64_t actual_read = 0;
   int64_t null_count = 0;
+
+  auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
+
+  ByteArray* values = this->values();
 
   uint8_t* valid_bits = valid_bits_->mutable_data();
   const int64_t valid_bits_offset = values_written_;
@@ -726,15 +717,29 @@ void RecordReader<DType>::PopulateValues(int64_t values_to_read,
                              levels_position_ - start_level_position, max_def_level_,
                              max_rep_level_, &implied_values_read, &null_count,
                              valid_bits, valid_bits_offset);
+    DCHECK_EQ(values_to_read, implied_values_read);
     actual_read =
-        ReadValuesSpaced(values_to_read, this->values(), static_cast<int>(null_count),
+        ReadValuesSpaced(values_to_read, values, static_cast<int>(null_count),
                          valid_bits, valid_bits_offset);
+    for (int64_t i = 0; i < actual_read; i++) {
+      if (::arrow::BitUtil::GetBit(valid_bits, valid_bits_offset + i)) {
+        PARQUET_THROW_NOT_OK(builder->Append(values[i].ptr,
+                                             static_cast<int64_t>(values[i].len)));
+      } else {
+        PARQUET_THROW_NOT_OK(builder->AppendNull());
+      }
+    }
   } else {
     actual_read = ReadValues(values_to_read, this->values());
-    for (int64_t i = 0; i < values_to_read; i++) {
+    for (int64_t i = 0; i < actual_read; i++) {
       ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
+      PARQUET_THROW_NOT_OK(builder->Append(values[i].ptr,
+                                           static_cast<int64_t>(values[i].len)));
     }
   }
+
+  values_written_ += values_to_read;
+  ResetValues();
 
   if (actual_values_read != values_to_read) {
     std::stringstream ss;
@@ -742,12 +747,8 @@ void RecordReader<DType>::PopulateValues(int64_t values_to_read,
        << actual_values_read;
     throw ParquetException(ss.str());
   }
-
-  values_written_ += values_to_read;
-  null_count_ += null_count;
-
-  return total_values;
 }
+
 
 // ----------------------------------------------------------------------
 // Instantiate templated classes

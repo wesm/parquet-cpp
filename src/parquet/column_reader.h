@@ -257,10 +257,10 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
   bool nullable_values() const { return nullable_values_; }
 
  private:
-  void Reset();
+  void ConsumeRecords();
+  void ResetValues();
   void Reserve(int64_t capacity);
   void AdvanceWritten(int64_t levels_written, int64_t values_written);
-  void Advance(int64_t levels_consumed, int64_t values_consumed);
 
   // Process written repetition/definition levels to reach the end of
   // records. Process no more levels than necessary to delimit the indicated
