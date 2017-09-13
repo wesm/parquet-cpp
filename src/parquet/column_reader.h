@@ -473,25 +473,32 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
 
   int64_t levels_position() const { return levels_position_; }
   int64_t levels_written() const { return levels_written_; }
+  int64_t null_count() const { return null_count_; }
 
   bool nullable_values() const { return nullable_values_; }
 
-  std::shared_ptr<Buffer> ReleaseValues() {
-
+  std::shared_ptr<PoolBuffer> ReleaseValues() {
+    auto result = values_;
+    values_ = std::make_shared<PoolBuffer>(pool_);
+    return result;
   }
 
-  std::shared_ptr<Buffer> ReleaseIsValid() {
-
+  std::shared_ptr<PoolBuffer> ReleaseIsValid() {
+    auto result = valid_bits_;
+    valid_bits_ = std::make_shared<PoolBuffer>(pool_);
+    return result;
   }
+
+  void Reset();
 
  private:
-  void Reset();
   void ResetValues();
   void Reserve(int64_t capacity);
 
   using ColumnReader::num_decoded_values_;
   using ColumnReader::num_buffered_values_;
   using ColumnReader::descr_;
+  using ColumnReader::pool_;
 
   // Process written repetition/definition levels to reach the end of
   // records. Process no more levels than necessary to delimit the indicated
