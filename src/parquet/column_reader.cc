@@ -337,6 +337,350 @@ void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
 }  // namespace internal
 
 // ----------------------------------------------------------------------
+
+RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
+    : descr_(descr),
+      pool_(pool),
+      max_def_level_(descr->max_definition_level()),
+      max_rep_level_(descr->max_repetition_level()) {
+  nullable_values_ = !descr->schema_node()->is_required();
+  values_ = std::make_shared<PoolBuffer>(pool);
+  valid_bits_ = std::make_shared<PoolBuffer>(pool);
+  def_levels_ = std::make_shared<PoolBuffer>(pool);
+  rep_levels_ = std::make_shared<PoolBuffer>(pool);
+
+  if (descr->physical_type() == Type::BYTE_ARRAY) {
+    builder_.reset(new ::arrow::BinaryBuilder(pool));
+  } else if (descr->physical_type() == Type::FIXED_LEN_BYTE_ARRAY) {
+    int byte_width = descr->type_length();
+    std::shared_ptr<::arrow::DataType> type = ::arrow::fixed_size_binary(byte_width);
+    builder_.reset(new ::arrow::FixedSizeBinaryBuilder(type, pool));
+  }
+
+  Reset();
+}
+
+int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
+  // HasNext invokes ReadNewPage
+  if (!reader->HasNext()) {
+    return 0;
+  }
+
+  const int64_t start_levels_position = levels_position_;
+
+  // Delimit records, then read values at the end
+  int64_t values_seen = 0;
+  int64_t values_to_read = 0;
+  int64_t records_read = 0;
+
+  if (levels_position_ < levels_written_) {
+    records_read += DelimitRecords(num_records, &values_seen);
+    values_to_read += values_seen;
+  }
+
+  DCHECK_EQ(levels_position_, levels_written_);
+
+  // If we are in the middle of a record, we continue until reaching the
+  // desired number of records or the end of the current record if we've found
+  // enough records
+  while (!at_record_start_ || records_read < num_records) {
+    // Is there more data to read in this row group?
+    if (!reader->HasNext()) {
+      break;
+    }
+
+    /// We perform multiple batch reads until we either exhaust the row group
+    /// or observe the desired number of records
+    int64_t batch_size =
+        std::min(num_records - records_read,
+                 reader->buffered_values_current_page() - levels_written_);
+    Reserve(batch_size);
+
+    int16_t* def_levels = this->def_levels() + levels_written_;
+    int16_t* rep_levels = this->rep_levels() + levels_written_;
+
+    // Not present for non-repeated fields
+    int64_t levels_read = 0;
+    if (max_rep_level_ > 0) {
+      levels_read = reader->ReadDefinitionLevels(batch_size, def_levels);
+      if (reader->ReadRepetitionLevels(batch_size, rep_levels) != levels_read) {
+        throw ParquetException("Number of decoded rep / def levels did not match");
+      }
+    } else if (max_def_level_ > 0) {
+      levels_read = reader->ReadDefinitionLevels(batch_size, def_levels);
+    }
+
+    levels_written_ += levels_read;
+
+    records_read += DelimitRecords(num_records - records_read, &values_seen);
+    values_to_read += values_seen;
+
+    // Exhausted data page
+    if (levels_read == 0) {
+      break;
+    }
+  }
+
+  int64_t null_count = 0;
+
+  if (nullable_values_) {
+    int64_t implied_values_read = 0;
+    int64_t null_count = 0;
+    internal::DefinitionLevelsToBitmap(
+        this->def_levels() + start_levels_position,
+        levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
+        &implied_values_read, &null_count, valid_bits, valid_bits_offset);
+    ReadValuesSpaced(reader, values_to_read, null_count);
+  } else {
+    ReadValues(reader, values_to_read);
+  }
+  values_written_ += values_to_read;
+  null_count_ += null_count;
+
+  return records_read;
+}
+
+int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) {
+  int64_t values_to_read = 0;
+  int64_t records_read = 0;
+
+  const int16_t* def_levels = this->def_levels();
+  const int16_t* rep_levels = this->rep_levels();
+
+  if (max_rep_level_ > 0) {
+    // Count logical records and number of values to read
+    for (; levels_position_ < levels_written_; ++levels_position_) {
+      if (def_levels[levels_position_] == max_def_level_) {
+        ++values_to_read;
+      }
+      if (rep_levels[levels_position_] == 0) {
+        ++records_read;
+        at_record_start_ = true;
+      } else {
+        at_record_start_ = false;
+      }
+    }
+  } else {
+    if (max_def_level_ > 0) {
+      for (; levels_position_ < levels_written_; ++levels_position_) {
+        if (def_levels[levels_position_] == max_def_level_) {
+          ++values_to_read;
+        }
+        ++records_read;
+      }
+    } else {
+      int64_t num_values = levels_written_ - levels_position_;
+      values_to_read += num_values;
+      records_read += num_values;
+      levels_position_ += num_values;
+    }
+  }
+  *values_seen = values_to_read;
+  return records_read;
+}
+
+void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
+  uint8_t* valid_bits = valid_bits_->mutable_data();
+  const int64_t valid_bits_offset = values_written_;
+  uint8_t* values = ;
+  int64_t actual_read = 0;
+
+#define READ_PRIMITIVE(PARQUET_TYPE)                                               \
+  {                                                                                \
+    auto typed_reader = static_cast < TypedColumnReader<PARQUET_TYPE*>(reader);    \
+    auto values =                                                                  \
+        reinterpret_cast<typename PARQUET_TYPE::c_type*>(values_->mutable_data()); \
+    actual_read = typed_reader->ReadValues(values_to_read, values);                \
+    for (int64_t i = 0; i < values_to_read; i++) {                                 \
+      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);                 \
+    }                                                                              \
+  }
+
+  switch (descr_->physical_type()) {
+    case Type::BOOLEAN:
+      READ_PRIMITIVE(BooleanType);
+      break;
+    case Type::INT32:
+      READ_PRIMITIVE(Int32Type);
+      break;
+    case Type::INT64:
+      READ_PRIMITIVE(Int64Type);
+      break;
+    case Type::INT96:
+      READ_PRIMITIVE(Int96Type);
+      break;
+    case Type::FLOAT:
+      READ_PRIMITIVE(FloatType);
+      break;
+    case Type::DOUBLE:
+      READ_PRIMITIVE(DoubleType);
+      break;
+    case Type::BYTE_ARRAY: {
+      auto typed_reader = static_cast<ByteArrayReader*>(reader);
+      auto values = reinterpret_cast<ByteArray*>(values_->mutable_data()) actual_read =
+          typed_reader->ReadValuesSpaced(values_to_read, values);
+      auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
+      for (int64_t i = 0; i < actual_read; i++) {
+        PARQUET_THROW_NOT_OK(
+            builder->Append(values[i].ptr, static_cast<int64_t>(values[i].len)));
+      }
+      ResetValues();
+    } break;
+    case Type::FIXED_LEN_BYTE_ARRAY: {
+      auto typed_reader = static_cast<FixedLenByteArrayReader*>(reader);
+      auto values = reinterpret_cast<FLBA*>(values_->mutable_data()) actual_read =
+          typed_reader->ReadValues(values_to_read, values);
+      auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
+      for (int64_t i = 0; i < actual_read; i++) {
+        PARQUET_THROW_NOT_OK(builder->Append(values[i].ptr));
+      }
+      ResetValues();
+    } break;
+  }
+
+#undef READ_PRIMITIVE
+
+  DCHECK_EQ(actual_read, values_to_read);
+}
+
+void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read,
+                                    int64_t null_count) {
+  uint8_t* valid_bits = valid_bits_->mutable_data();
+  const int64_t valid_bits_offset = values_written_;
+  uint8_t* values = values_->mutable_data();
+  int64_t actual_read = 0;
+
+#define READ_PRIMITIVE(PARQUET_TYPE)                                                 \
+  {                                                                                  \
+    auto typed_reader = static_cast < TypedColumnReader<PARQUET_TYPE*>(reader);      \
+    auto values =                                                                    \
+        reinterpret_cast<typename PARQUET_TYPE::c_type*>(values_->mutable_data());   \
+    actual_read = typed_reader->ReadValuesSpaced(values_to_read, values, null_count, \
+                                                 valid_bits, valid_bits_offset);     \
+  }
+
+  switch (descr_->physical_type()) {
+    case Type::BOOLEAN:
+      READ_PRIMITIVE(BooleanType);
+      break;
+    case Type::INT32:
+      READ_PRIMITIVE(Int32Type);
+      break;
+    case Type::INT64:
+      READ_PRIMITIVE(Int64Type);
+      break;
+    case Type::INT96:
+      READ_PRIMITIVE(Int96Type);
+      break;
+    case Type::FLOAT:
+      READ_PRIMITIVE(FloatType);
+      break;
+    case Type::DOUBLE:
+      READ_PRIMITIVE(DoubleType);
+      break;
+    case Type::BYTE_ARRAY: {
+      auto typed_reader = static_cast<ByteArrayReader*>(reader);
+      auto values = reinterpret_cast<ByteArray*>(values_->mutable_data()) actual_read =
+          typed_reader->ReadValuesSpaced(values_to_read, values, null_count, valid_bits,
+                                         valid_bits_offset);
+      auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
+
+      for (int64_t i = 0; i < actual_read; i++) {
+        if (::arrow::BitUtil::GetBit(valid_bits, valid_bits_offset + i)) {
+          PARQUET_THROW_NOT_OK(
+              builder->Append(values[i].ptr, static_cast<int64_t>(values[i].len)));
+        } else {
+          PARQUET_THROW_NOT_OK(builder->AppendNull());
+        }
+      }
+      ResetValues();
+    } break;
+    case Type::FIXED_LEN_BYTE_ARRAY: {
+      auto typed_reader = static_cast<FixedLenByteArrayReader*>(reader);
+      auto values = reinterpret_cast<FLBA*>(values_->mutable_data()) actual_read =
+          typed_reader->ReadValuesSpaced(values_to_read, values, null_count, valid_bits,
+                                         valid_bits_offset);
+      auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
+      for (int64_t i = 0; i < actual_read; i++) {
+        if (::arrow::BitUtil::GetBit(valid_bits, valid_bits_offset + i)) {
+          PARQUET_THROW_NOT_OK(builder->Append(values[i].ptr));
+        } else {
+          PARQUET_THROW_NOT_OK(builder->AppendNull());
+        }
+      }
+      ResetValues();
+    } break;
+  }
+  DCHECK_EQ(actual_read, values_to_read);
+}
+
+void RecordReader::Reserve(int64_t capacity) {
+  if (levels_written_ + capacity > levels_capacity_) {
+    int64_t new_levels_capacity = BitUtil::NextPower2(levels_capacity_ + 1);
+    while (levels_written_ + capacity > new_levels_capacity) {
+      new_levels_capacity = BitUtil::NextPower2(new_levels_capacity + 1);
+    }
+    if (descr_->max_definition_level() > 0) {
+      PARQUET_THROW_NOT_OK(
+          def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
+      PARQUET_THROW_NOT_OK(
+          valid_bits_->Resize(BitUtil::BytesForBits(new_levels_capacity), false));
+    }
+    if (descr_->max_repetition_level() > 0) {
+      PARQUET_THROW_NOT_OK(
+          rep_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
+    }
+    levels_capacity_ = new_levels_capacity;
+  }
+  if (values_written_ + capacity > values_capacity_) {
+    int64_t new_values_capacity = BitUtil::NextPower2(values_capacity_ + 1);
+    while (values_written_ + capacity > new_values_capacity) {
+      new_values_capacity = BitUtil::NextPower2(new_values_capacity + 1);
+    }
+
+    int type_size = GetTypeByteSize(descr_->physical_type());
+    PARQUET_THROW_NOT_OK(values_->Resize(new_values_capacity * type_size, false));
+
+    values_capacity_ = new_values_capacity;
+  }
+}
+
+void RecordReader::Reset() {
+  ResetValues();
+
+  const int64_t levels_remaining = levels_written_ - levels_position_;
+
+  // Shift remaining levels to beginning of buffer and trim to only the number
+  // of decoded levels remaining
+  int16_t* def_data = def_levels();
+  int16_t* rep_data = rep_levels();
+
+  std::copy(def_data + levels_position_, def_data + levels_written_, def_data);
+  std::copy(rep_data + levels_position_, rep_data + levels_written_, rep_data);
+
+  PARQUET_THROW_NOT_OK(def_levels_->Resize(levels_remaining * sizeof(int16_t), false));
+  PARQUET_THROW_NOT_OK(rep_levels_->Resize(levels_remaining * sizeof(int16_t), false));
+
+  at_record_start_ = false;
+  records_read_ = 0;
+
+  levels_written_ -= levels_position_;
+  levels_position_ = 0;
+  levels_capacity_ = levels_remaining;
+
+  // Calling Finish on the builders also resets them
+}
+
+void RecordReader::ResetValues() {
+  // Resize to 0, but do not shrink to fit
+  PARQUET_THROW_NOT_OK(values_->Resize(0, false));
+  PARQUET_THROW_NOT_OK(valid_bits_->Resize(0, false));
+  values_written_ = 0;
+  values_capacity_ = 0;
+  null_count_ = 0;
+}
+
+// ----------------------------------------------------------------------
 // Instantiate templated classes
 
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<BooleanType>;
@@ -347,14 +691,5 @@ template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<FloatType>;
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<DoubleType>;
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<ByteArrayType>;
 template class PARQUET_TEMPLATE_EXPORT TypedColumnReader<FLBAType>;
-
-template class PARQUET_TEMPLATE_EXPORT RecordReader<BooleanType>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<Int32Type>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<Int64Type>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<Int96Type>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<FloatType>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<DoubleType>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<ByteArrayType>;
-template class PARQUET_TEMPLATE_EXPORT RecordReader<FLBAType>;
 
 }  // namespace parquet
