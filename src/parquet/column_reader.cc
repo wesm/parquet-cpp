@@ -429,11 +429,8 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
   }
 
   int64_t null_count = 0;
-
   if (nullable_values_) {
     int64_t implied_values_read = 0;
-    int64_t null_count = 0;
-
     uint8_t* valid_bits = valid_bits_->mutable_data();
     const int64_t valid_bits_offset = values_written_;
 
@@ -445,7 +442,9 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
   } else {
     ReadValues(reader, values_to_read);
   }
-  values_written_ += values_to_read;
+
+  // Total values, including null spaces, if any
+  values_written_ += values_to_read + null_count;
   null_count_ += null_count;
 
   return records_read;
@@ -675,7 +674,6 @@ void RecordReader::Reset() {
     levels_capacity_ = levels_remaining;
   }
 
-  at_record_start_ = false;
   records_read_ = 0;
 
   // Calling Finish on the builders also resets them

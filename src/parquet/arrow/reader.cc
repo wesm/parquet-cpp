@@ -384,9 +384,6 @@ Status FileReader::Impl::ReadColumn(int i, std::shared_ptr<Array>* out) {
 Status FileReader::Impl::GetSchema(const std::vector<int>& indices,
                                    std::shared_ptr<::arrow::Schema>* out) {
   auto descr = reader_->metadata()->schema();
-
-  std::cout << descr->ToString() << std::endl;
-
   auto parquet_key_value_metadata = reader_->metadata()->key_value_metadata();
   return FromParquetSchema(descr, indices, parquet_key_value_metadata, out);
 }
@@ -773,11 +770,15 @@ struct TransferFunctor<::arrow::BooleanType, BooleanType> {
                     std::shared_ptr<Array>* out) {
     int64_t length = reader->values_written();
     std::shared_ptr<Buffer> data;
-    RETURN_NOT_OK(::arrow::AllocateBuffer(pool, BytesForBits(length), &data));
+
+    const int64_t buffer_size = BytesForBits(length);
+    RETURN_NOT_OK(::arrow::AllocateBuffer(pool, buffer_size, &data));
 
     // Transfer boolean values to packed bitmap
     auto values = reinterpret_cast<const bool*>(reader->values());
     uint8_t* data_ptr = data->mutable_data();
+    memset(data_ptr, 0, buffer_size);
+
     for (int64_t i = 0; i < length; i++) {
       if (values[i]) {
         ::arrow::BitUtil::SetBit(data_ptr, i);
@@ -858,7 +859,15 @@ struct TransferFunctor<
   Status operator()(RecordReader* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
-    return reader->builder()->Finish(out);
+    RETURN_NOT_OK(reader->builder()->Finish(out));
+
+    if (type->id() == ::arrow::Type::STRING) {
+      // Convert from BINARY type to STRING
+      auto new_data = (*out)->data()->ShallowCopy();
+      new_data->type = type;
+      RETURN_NOT_OK(::arrow::MakeArray(new_data, out));
+    }
+    return Status::OK();
   }
 };
 
@@ -872,8 +881,8 @@ Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
       break;
     }
 
-    int64_t records_read = record_reader_->ReadRecords(column_reader_.get(),
-                                                       records_to_read);
+    int64_t records_read =
+        record_reader_->ReadRecords(column_reader_.get(), records_to_read);
     records_to_read -= records_read;
     if (!column_reader_->HasNext()) {
       NextRowGroup();
