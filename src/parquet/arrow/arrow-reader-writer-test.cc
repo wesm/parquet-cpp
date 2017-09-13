@@ -344,7 +344,7 @@ static std::shared_ptr<GroupNode> MakeSimpleSchema(const ::arrow::DataType& type
   return std::static_pointer_cast<GroupNode>(node_);
 }
 
-void AssertArraysEquals(const Array& expected, const Array& actual) {
+void AssertArraysEqual(const Array& expected, const Array& actual) {
   if (!actual.Equals(expected)) {
     std::stringstream pp_result;
     std::stringstream pp_expected;
@@ -418,7 +418,7 @@ class TestParquetIO : public ::testing::Test {
     ReaderFromSink(&reader);
     ReadSingleColumnFile(std::move(reader), &out);
 
-    AssertArraysEquals(*out, values);
+    AssertArraysEqual(values, *out);
   }
 
   void ReadTableFromFile(std::unique_ptr<FileReader> reader,
@@ -470,7 +470,7 @@ class TestParquetIO : public ::testing::Test {
     ASSERT_EQ(1, chunked_array->num_chunks());
     auto result = chunked_array->chunk(0);
 
-    AssertArraysEquals(*result, *values);
+    AssertArraysEqual(*values, *result);
   }
 
   void CheckRoundTrip(const std::shared_ptr<Table>& table) {
@@ -535,7 +535,7 @@ TYPED_TEST(TestParquetIO, SingleColumnTableRequiredWrite) {
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
 
-  AssertArraysEquals(*values, *chunked_array->chunk(0));
+  AssertArraysEqual(*values, *chunked_array->chunk(0));
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnOptionalReadWrite) {
@@ -681,7 +681,7 @@ TYPED_TEST(TestParquetIO, SingleColumnTableRequiredChunkedWriteArrowIO) {
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
 
-  AssertArraysEquals(*values, *chunked_array->chunk(0));
+  AssertArraysEqual(*values, *chunked_array->chunk(0));
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnOptionalChunkedWrite) {
@@ -853,7 +853,7 @@ TEST_F(TestStringParquetIO, EmptyStringColumnRequiredWrite) {
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
 
-  AssertArraysEquals(*values, *chunked_array->chunk(0));
+  AssertArraysEqual(*values, *chunked_array->chunk(0));
 }
 
 using TestNullParquetIO = TestParquetIO<::arrow::NullType>;
@@ -875,7 +875,7 @@ TEST_F(TestNullParquetIO, NullColumn) {
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
 
-  AssertArraysEquals(*values, *chunked_array->chunk(0));
+  AssertArraysEqual(*values, *chunked_array->chunk(0));
 }
 
 template <typename T>

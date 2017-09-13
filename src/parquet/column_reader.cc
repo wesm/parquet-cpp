@@ -399,8 +399,13 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
     /// We perform multiple batch reads until we either exhaust the row group
     /// or observe the desired number of records
     int64_t batch_size =
-        std::min(num_records - records_read,
-                 reader->buffered_values_current_page() - levels_written_);
+        std::min(num_records - records_read, reader->available_values_current_page());
+
+    // No more data in column
+    if (batch_size == 0) {
+      break;
+    }
+
     Reserve(batch_size);
 
     int16_t* def_levels = this->def_levels() + levels_written_;
@@ -419,28 +424,38 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
 
     levels_written_ += levels_read;
 
-    records_read += DelimitRecords(num_records - records_read, &values_seen);
+    if (max_def_level_ > 0) {
+      records_read += DelimitRecords(num_records - records_read, &values_seen);
+    } else {
+      values_seen = batch_size;
+      records_read += batch_size;
+    }
     values_to_read += values_seen;
 
-    // Exhausted data page
+    // This advanced whether or not there are definition levels
+    reader->ConsumeBufferedValues(std::max(values_seen, levels_read));
+
+    // Exhausted column chunk
     if (levels_read == 0) {
       break;
     }
   }
 
   int64_t null_count = 0;
-  if (nullable_values_) {
-    int64_t implied_values_read = 0;
-    uint8_t* valid_bits = valid_bits_->mutable_data();
-    const int64_t valid_bits_offset = values_written_;
+  if (values_to_read > 0 || levels_position_ > start_levels_position) {
+    if (nullable_values_) {
+      int64_t implied_values_read = 0;
+      uint8_t* valid_bits = valid_bits_->mutable_data();
+      const int64_t valid_bits_offset = values_written_;
 
-    internal::DefinitionLevelsToBitmap(
-        this->def_levels() + start_levels_position,
-        levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
-        &implied_values_read, &null_count, valid_bits, valid_bits_offset);
-    ReadValuesSpaced(reader, values_to_read + null_count, null_count);
-  } else {
-    ReadValues(reader, values_to_read);
+      internal::DefinitionLevelsToBitmap(
+          this->def_levels() + start_levels_position,
+          levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
+          &implied_values_read, &null_count, valid_bits, valid_bits_offset);
+      ReadValuesSpaced(reader, values_to_read + null_count, null_count);
+    } else {
+      ReadValues(reader, values_to_read);
+    }
   }
 
   // Total values, including null spaces, if any
@@ -490,12 +505,11 @@ int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) 
 void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
   int64_t actual_read = 0;
 
-#define READ_PRIMITIVE(PARQUET_TYPE)                                               \
-  {                                                                                \
-    auto typed_reader = static_cast<TypedColumnReader<PARQUET_TYPE>*>(reader);     \
-    auto values =                                                                  \
-        reinterpret_cast<typename PARQUET_TYPE::c_type*>(values_->mutable_data()); \
-    actual_read = typed_reader->ReadValues(values_to_read, values);                \
+#define READ_PRIMITIVE(PARQUET_TYPE)                                           \
+  {                                                                            \
+    auto typed_reader = static_cast<TypedColumnReader<PARQUET_TYPE>*>(reader); \
+    auto values = ValuesHead<typename PARQUET_TYPE::c_type>();                 \
+    actual_read = typed_reader->ReadValues(values_to_read, values);            \
   }
 
   switch (descr_->physical_type()) {
@@ -519,7 +533,7 @@ void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
       break;
     case Type::BYTE_ARRAY: {
       auto typed_reader = static_cast<ByteArrayReader*>(reader);
-      auto values = reinterpret_cast<ByteArray*>(values_->mutable_data());
+      auto values = ValuesHead<ByteArray>();
       actual_read = typed_reader->ReadValues(values_to_read, values);
       auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
       for (int64_t i = 0; i < actual_read; i++) {
@@ -530,7 +544,7 @@ void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
     } break;
     case Type::FIXED_LEN_BYTE_ARRAY: {
       auto typed_reader = static_cast<FixedLenByteArrayReader*>(reader);
-      auto values = reinterpret_cast<FLBA*>(values_->mutable_data());
+      auto values = ValuesHead<FLBA>();
       actual_read = typed_reader->ReadValues(values_to_read, values);
       auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
       for (int64_t i = 0; i < actual_read; i++) {
@@ -554,8 +568,7 @@ void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read
 #define READ_PRIMITIVE(PARQUET_TYPE)                                                 \
   {                                                                                  \
     auto typed_reader = static_cast<TypedColumnReader<PARQUET_TYPE>*>(reader);       \
-    auto values =                                                                    \
-        reinterpret_cast<typename PARQUET_TYPE::c_type*>(values_->mutable_data());   \
+    auto values = ValuesHead<typename PARQUET_TYPE::c_type>();                       \
     actual_read = typed_reader->ReadValuesSpaced(values_to_read, values, null_count, \
                                                  valid_bits, valid_bits_offset);     \
   }
@@ -581,7 +594,7 @@ void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read
       break;
     case Type::BYTE_ARRAY: {
       auto typed_reader = static_cast<ByteArrayReader*>(reader);
-      auto values = reinterpret_cast<ByteArray*>(values_->mutable_data());
+      auto values = ValuesHead<ByteArray>();
       actual_read = typed_reader->ReadValuesSpaced(values_to_read, values, null_count,
                                                    valid_bits, valid_bits_offset);
       auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
@@ -598,7 +611,7 @@ void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read
     } break;
     case Type::FIXED_LEN_BYTE_ARRAY: {
       auto typed_reader = static_cast<FixedLenByteArrayReader*>(reader);
-      auto values = reinterpret_cast<FLBA*>(values_->mutable_data());
+      auto values = ValuesHead<FLBA>();
       actual_read = typed_reader->ReadValuesSpaced(values_to_read, values, null_count,
                                                    valid_bits, valid_bits_offset);
       auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
@@ -633,8 +646,7 @@ void RecordReader::Reserve(int64_t capacity) {
       int64_t nbytes_old = BitUtil::BytesForBits(levels_written_);
       int64_t nbytes_new = BitUtil::BytesForBits(new_levels_capacity);
       PARQUET_THROW_NOT_OK(valid_bits_->Resize(nbytes_new, false));
-      memset(valid_bits_->mutable_data() + nbytes_old * sizeof(int16_t), 0,
-             (nbytes_new - nbytes_old) * sizeof(int16_t));
+      memset(valid_bits_->mutable_data() + nbytes_old, 0, nbytes_new - nbytes_old);
     }
     if (descr_->max_repetition_level() > 0) {
       PARQUET_THROW_NOT_OK(
