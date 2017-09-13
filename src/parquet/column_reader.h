@@ -225,8 +225,10 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
   // Returns the number of levels skipped
   int64_t Skip(int64_t num_rows_to_skip);
 
- protected:
+ private:
   typedef Decoder<DType> DecoderType;
+
+  friend RecordReader;
 
   // Advance to the next data page
   bool ReadNewPage() override;
