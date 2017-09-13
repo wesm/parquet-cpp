@@ -72,6 +72,8 @@ class PARQUET_EXPORT LevelDecoder {
   std::unique_ptr<::arrow::BitReader> bit_packed_decoder_;
 };
 
+class RecordReader;
+
 class PARQUET_EXPORT ColumnReader {
  public:
   ColumnReader(const ColumnDescriptor*, std::unique_ptr<PageReader>,
@@ -94,12 +96,16 @@ class PARQUET_EXPORT ColumnReader {
     return true;
   }
 
+  int64_t buffered_values_current_page() const { return num_buffered_values_; }
+
   Type::type type() const { return descr_->physical_type(); }
 
   const ColumnDescriptor* descr() const { return descr_; }
 
  protected:
   virtual bool ReadNewPage() = 0;
+
+  friend RecordReader;
 
   // Read multiple definition levels into preallocated memory
   //
@@ -223,7 +229,7 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
   typedef Decoder<DType> DecoderType;
 
   // Advance to the next data page
-  virtual bool ReadNewPage();
+  bool ReadNewPage() override;
 
   // Read up to batch_size values from the current data page into the
   // pre-allocated memory T*
@@ -445,18 +451,11 @@ int64_t TypedColumnReader<DType>::Skip(int64_t num_rows_to_skip) {
 
 /// \brief Stateful column reader that delimits semantic records for both flat
 /// and nested columns
-template <typename DType>
-class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
+class PARQUET_EXPORT RecordReader {
  public:
-  using BASE = TypedColumnReader<DType>;
-  using T = typename BASE::T;
-
   RecordReader(const ColumnDescriptor* descr, ::arrow::MemoryPool* pool);
 
-  /// \return Number of records read
-  int64_t ReadRecords(int64_t num_records);
-
-  int64_t records_read() const { return records_read_; }
+  ~RecordReader() {}
 
   int16_t* def_levels() {
     return reinterpret_cast<int16_t*>(def_levels_->mutable_data());
@@ -466,7 +465,7 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
     return reinterpret_cast<int16_t*>(rep_levels_->mutable_data());
   }
 
-  T* values() { return reinterpret_cast<T*>(values_->mutable_data()); }
+  uint8_t* values() { return values_->mutable_data(); }
 
   /// \brief Number of values written including nulls (if any)
   int64_t values_written() const { return values_written_; }
@@ -476,6 +475,17 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
   int64_t null_count() const { return null_count_; }
 
   bool nullable_values() const { return nullable_values_; }
+
+  int64_t records_read() const { return records_read_; }
+
+  int64_t ReadRecords(ColumnReader* reader, int64_t num_records);
+
+  void Reset();
+  void Reserve(int64_t capacity);
+  void ResetValues();
+
+  // Returns number of records scanned
+  int64_t ScanRecords(ColumnReader* reader, int64_t num_records);
 
   std::shared_ptr<PoolBuffer> ReleaseValues() {
     auto result = values_;
@@ -489,25 +499,11 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
     return result;
   }
 
-  void Reset();
+  ::arrow::ArrayBuilder* builder() { return builder_.get(); }
 
- private:
-  void ResetValues();
-  void Reserve(int64_t capacity);
-
-  using ColumnReader::num_decoded_values_;
-  using ColumnReader::num_buffered_values_;
-  using ColumnReader::descr_;
-  using ColumnReader::pool_;
-
-  // Process written repetition/definition levels to reach the end of
-  // records. Process no more levels than necessary to delimit the indicated
-  // number of logical records. Updates internal state of RecordReader
-  //
-  // \return Number of records delimited
-  int64_t DelimitRecords(int64_t num_records, int64_t* values_seen);
-
-  void PopulateValues(int64_t values_to_read, const int64_t start_levels_position);
+ protected:
+  const ColumnDescriptor* descr_;
+  ::arrow::MemoryPool* pool_;
 
   const int max_def_level_;
   const int max_rep_level_;
@@ -532,303 +528,17 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
   std::shared_ptr<::arrow::PoolBuffer> valid_bits_;
   std::shared_ptr<::arrow::PoolBuffer> def_levels_;
   std::shared_ptr<::arrow::PoolBuffer> rep_levels_;
+
+  void ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read, int64_t null_count);
+  void ReadValues(ColumnReader* reader, int64_t values_to_read);
+
+  // Process written repetition/definition levels to reach the end of
+  // records. Process no more levels than necessary to delimit the indicated
+  // number of logical records. Updates internal state of RecordReader
+  //
+  // \return Number of records delimited
+  int64_t DelimitRecords(int64_t num_records, int64_t* values_seen);
 };
-
-template <typename DType>
-RecordReader<DType>::RecordReader(const ColumnDescriptor* descr,
-                                  ::arrow::MemoryPool* pool)
-    : TypedColumnReader<DType>(descr, pool),
-      max_def_level_(descr->max_definition_level()),
-      max_rep_level_(descr->max_repetition_level()) {
-  nullable_values_ = !descr->schema_node()->is_required();
-  values_ = std::make_shared<PoolBuffer>(pool);
-  valid_bits_ = std::make_shared<PoolBuffer>(pool);
-  def_levels_ = std::make_shared<PoolBuffer>(pool);
-  rep_levels_ = std::make_shared<PoolBuffer>(pool);
-
-  if (descr->physical_type() == Type::BYTE_ARRAY) {
-    builder_.reset(new ::arrow::BinaryBuilder(pool));
-  } else if (descr->physical_type() == Type::FIXED_LEN_BYTE_ARRAY) {
-    int byte_width = descr->type_length();
-    std::shared_ptr<::arrow::DataType> type = ::arrow::fixed_size_binary(byte_width);
-    builder_.reset(new ::arrow::FixedSizeBinaryBuilder(type, pool));
-  }
-
-  Reset();
-}
-
-template <typename DType>
-void RecordReader<DType>::ResetValues() {
-  // Resize to 0, but do not shrink to fit
-  PARQUET_THROW_NOT_OK(values_->Resize(0, false));
-  PARQUET_THROW_NOT_OK(valid_bits_->Resize(0, false));
-  values_written_ = 0;
-  values_capacity_ = 0;
-  null_count_ = 0;
-}
-
-template <typename DType>
-void RecordReader<DType>::Reset() {
-  ResetValues();
-
-  const int64_t levels_remaining = levels_written_ - levels_position_;
-
-  // Shift remaining levels to beginning of buffer and trim to only the number
-  // of decoded levels remaining
-  int16_t* def_data = def_levels();
-  int16_t* rep_data = rep_levels();
-
-  std::copy(def_data + levels_position_, def_data + levels_written_, def_data);
-  std::copy(rep_data + levels_position_, rep_data + levels_written_, rep_data);
-
-  PARQUET_THROW_NOT_OK(def_levels_->Resize(levels_remaining * sizeof(int16_t), false));
-  PARQUET_THROW_NOT_OK(rep_levels_->Resize(levels_remaining * sizeof(int16_t), false));
-
-  at_record_start_ = false;
-  records_read_ = 0;
-
-  levels_written_ -= levels_position_;
-  levels_position_ = 0;
-  levels_capacity_ = levels_remaining;
-
-  // Calling Finish on the builders also resets them
-}
-
-template <typename DType>
-void RecordReader<DType>::Reserve(int64_t capacity) {
-  int64_t new_levels_capacity = levels_capacity_ + capacity;
-  if (descr_->max_definition_level() > 0) {
-    PARQUET_THROW_NOT_OK(
-        def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
-    PARQUET_THROW_NOT_OK(
-        valid_bits_->Resize(::arrow::BitUtil::BytesForBits(new_levels_capacity), false));
-  }
-  if (descr_->max_repetition_level() > 0) {
-    PARQUET_THROW_NOT_OK(
-        rep_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
-  }
-  int64_t new_values_capacity = values_capacity_ + capacity;
-
-  int type_size = GetTypeByteSize(descr_->physical_type());
-  PARQUET_THROW_NOT_OK(values_->Resize(new_values_capacity * type_size, false));
-
-  values_capacity_ = new_values_capacity;
-  levels_capacity_ = new_levels_capacity;
-}
-
-template <typename DType>
-int64_t RecordReader<DType>::DelimitRecords(int64_t num_records, int64_t* values_seen) {
-  int64_t values_to_read = 0;
-  int64_t records_read = 0;
-
-  const int16_t* def_levels = this->def_levels();
-  const int16_t* rep_levels = this->rep_levels();
-
-  if (max_rep_level_ > 0) {
-    // Count logical records and number of values to read
-    for (; levels_position_ < levels_written_; ++levels_position_) {
-      if (def_levels[levels_position_] == max_def_level_) {
-        ++values_to_read;
-      }
-      if (rep_levels[levels_position_] == 0) {
-        ++records_read;
-        at_record_start_ = true;
-      } else {
-        at_record_start_ = false;
-      }
-    }
-  } else {
-    if (max_def_level_ > 0) {
-      for (; levels_position_ < levels_written_; ++levels_position_) {
-        if (def_levels[levels_position_] == max_def_level_) {
-          ++values_to_read;
-        }
-        ++records_read;
-      }
-    } else {
-      int64_t num_values = levels_written_ - levels_position_;
-      values_to_read += num_values;
-      records_read += num_values;
-      levels_position_ += num_values;
-    }
-  }
-  *values_seen = values_to_read;
-  return records_read;
-}
-
-template <typename DType>
-int64_t RecordReader<DType>::ReadRecords(int64_t num_records) {
-  // HasNext invokes ReadNewPage
-  if (!ColumnReader::HasNext()) {
-    return 0;
-  }
-
-  // Delimit records, then read values at the end
-  int64_t values_seen = 0;
-  int64_t values_to_read = 0;
-  int64_t records_read = 0;
-
-  const int64_t start_levels_position = levels_position_;
-
-  if (levels_position_ < levels_written_) {
-    records_read += DelimitRecords(num_records, &values_seen);
-    values_to_read += values_seen;
-  }
-
-  DCHECK_EQ(levels_position_, levels_written_);
-
-  // If we are in the middle of a record, we continue until reaching the
-  // desired number of records or the end of the current record if we've found
-  // enough records
-  while (!at_record_start_ || records_read < num_records) {
-    /// We perform multiple batch reads until we either exhaust the row group
-    /// or observe the desired number of records
-    int64_t batch_size =
-        std::min(num_records - records_read, num_buffered_values_ - levels_written_);
-    Reserve(batch_size);
-
-    int16_t* def_levels = this->def_levels() + levels_written_;
-    int16_t* rep_levels = this->rep_levels() + levels_written_;
-
-    // Not present for non-repeated fields
-    int64_t levels_read = 0;
-    if (max_rep_level_ > 0) {
-      levels_read = ColumnReader::ReadDefinitionLevels(batch_size, def_levels);
-      if (ColumnReader::ReadRepetitionLevels(batch_size, rep_levels) != levels_read) {
-        throw ParquetException("Number of decoded rep / def levels did not match");
-      }
-    } else if (max_def_level_ > 0) {
-      levels_read = ColumnReader::ReadDefinitionLevels(batch_size, def_levels);
-    }
-
-    levels_written_ += levels_read;
-
-    records_read += DelimitRecords(num_records - records_read, &values_seen);
-    values_to_read += values_seen;
-
-    // Exhausted data page
-    if (levels_read == 0) {
-      break;
-    }
-  }
-
-  PopulateValues(values_to_read, start_levels_position);
-  return records_read;
-}
-
-template <typename DType>
-void RecordReader<DType>::PopulateValues(int64_t values_to_read,
-                                         int64_t start_levels_position) {
-  int64_t actual_read = 0;
-  int64_t null_count = 0;
-
-  uint8_t* valid_bits = valid_bits_->mutable_data();
-  const int64_t valid_bits_offset = values_written_;
-  if (nullable_values_) {
-    int64_t implied_values_read = 0;
-    int64_t null_count = 0;
-    internal::DefinitionLevelsToBitmap(
-        this->def_levels() + start_levels_position,
-        levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
-        &implied_values_read, &null_count, valid_bits, valid_bits_offset);
-    actual_read =
-        ReadValuesSpaced(values_to_read, this->values(), static_cast<int>(null_count),
-                         valid_bits, valid_bits_offset);
-  } else {
-    actual_read = ReadValues(values_to_read, this->values());
-    for (int64_t i = 0; i < values_to_read; i++) {
-      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
-    }
-  }
-  DCHECK_EQ(actual_read, values_to_read);
-
-  values_written_ += values_to_read;
-  null_count_ += null_count;
-}
-
-template <>
-void RecordReader<ByteArrayType>::PopulateValues(int64_t values_to_read,
-                                                 int64_t start_levels_position) {
-  int64_t actual_read = 0;
-
-  auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
-
-  ByteArray* values = this->values();
-
-  uint8_t* valid_bits = valid_bits_->mutable_data();
-  const int64_t valid_bits_offset = values_written_;
-  if (nullable_values_) {
-    int64_t implied_values_read = 0;
-    int64_t null_count = 0;
-    internal::DefinitionLevelsToBitmap(
-        this->def_levels() + start_levels_position,
-        levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
-        &implied_values_read, &null_count, valid_bits, valid_bits_offset);
-    DCHECK_EQ(values_to_read, implied_values_read);
-    actual_read = ReadValuesSpaced(values_to_read, values, static_cast<int>(null_count),
-                                   valid_bits, valid_bits_offset);
-    for (int64_t i = 0; i < actual_read; i++) {
-      if (::arrow::BitUtil::GetBit(valid_bits, valid_bits_offset + i)) {
-        PARQUET_THROW_NOT_OK(
-            builder->Append(values[i].ptr, static_cast<int64_t>(values[i].len)));
-      } else {
-        PARQUET_THROW_NOT_OK(builder->AppendNull());
-      }
-    }
-  } else {
-    actual_read = ReadValues(values_to_read, this->values());
-    for (int64_t i = 0; i < actual_read; i++) {
-      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
-      PARQUET_THROW_NOT_OK(
-          builder->Append(values[i].ptr, static_cast<int64_t>(values[i].len)));
-    }
-  }
-  DCHECK_EQ(actual_read, values_to_read);
-
-  values_written_ += values_to_read;
-  ResetValues();
-}
-
-template <>
-void RecordReader<FLBAType>::PopulateValues(int64_t values_to_read,
-                                            int64_t start_levels_position) {
-  int64_t actual_read = 0;
-
-  auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
-
-  FixedLenByteArray* values = this->values();
-
-  uint8_t* valid_bits = valid_bits_->mutable_data();
-  const int64_t valid_bits_offset = values_written_;
-  if (nullable_values_) {
-    int64_t implied_values_read = 0;
-    int64_t null_count = 0;
-    internal::DefinitionLevelsToBitmap(
-        this->def_levels() + start_levels_position,
-        levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
-        &implied_values_read, &null_count, valid_bits, valid_bits_offset);
-    DCHECK_EQ(values_to_read, implied_values_read);
-    actual_read = ReadValuesSpaced(values_to_read, values, static_cast<int>(null_count),
-                                   valid_bits, valid_bits_offset);
-    for (int64_t i = 0; i < actual_read; i++) {
-      if (::arrow::BitUtil::GetBit(valid_bits, valid_bits_offset + i)) {
-        PARQUET_THROW_NOT_OK(builder->Append(values[i].ptr));
-      } else {
-        PARQUET_THROW_NOT_OK(builder->AppendNull());
-      }
-    }
-  } else {
-    actual_read = ReadValues(values_to_read, this->values());
-    for (int64_t i = 0; i < actual_read; i++) {
-      ::arrow::BitUtil::SetBit(valid_bits, valid_bits_offset + i);
-      PARQUET_THROW_NOT_OK(builder->Append(values[i].ptr));
-    }
-  }
-  DCHECK_EQ(actual_read, values_to_read);
-
-  values_written_ += values_to_read;
-  ResetValues();
-}
 
 // ----------------------------------------------------------------------
 // Template instantiations
@@ -850,15 +560,6 @@ extern template class PARQUET_EXPORT TypedColumnReader<FloatType>;
 extern template class PARQUET_EXPORT TypedColumnReader<DoubleType>;
 extern template class PARQUET_EXPORT TypedColumnReader<ByteArrayType>;
 extern template class PARQUET_EXPORT TypedColumnReader<FLBAType>;
-
-extern template class PARQUET_EXPORT RecordReader<BooleanType>;
-extern template class PARQUET_EXPORT RecordReader<Int32Type>;
-extern template class PARQUET_EXPORT RecordReader<Int64Type>;
-extern template class PARQUET_EXPORT RecordReader<Int96Type>;
-extern template class PARQUET_EXPORT RecordReader<FloatType>;
-extern template class PARQUET_EXPORT RecordReader<DoubleType>;
-extern template class PARQUET_EXPORT RecordReader<ByteArrayType>;
-extern template class PARQUET_EXPORT RecordReader<FLBAType>;
 
 }  // namespace parquet
 
