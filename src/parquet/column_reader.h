@@ -247,10 +247,14 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
 
   int16_t* rep_levels() { return reinterpret_cast<int16_t*>(rep_levels_.mutable_data()); }
 
-  int64_t levels_written() const { return num_decoded_values_; }
+  T* values() { return reinterpret_cast<T*>(values_.mutable_data()); }
 
   /// \brief Number of values written including nulls (if any)
   int64_t values_written() const { return values_written_; }
+
+  int64_t levels_written() const { return num_decoded_values_; }
+
+  bool nullable_values() const { return nullable_values_; }
 
  private:
   void Reset();
@@ -266,8 +270,6 @@ class PARQUET_EXPORT RecordReader : public TypedColumnReader<DType> {
   int64_t DelimitRecords(int64_t num_records, int64_t* values_seen);
 
   void PopulateValues(int64_t values_to_read);
-
-  T* values() { return reinterpret_cast<T*>(values_.mutable_data()) + values_position_; }
 
   const int max_def_level_;
   const int max_rep_level_;
@@ -311,14 +313,14 @@ extern template class PARQUET_EXPORT TypedColumnReader<DoubleType>;
 extern template class PARQUET_EXPORT TypedColumnReader<ByteArrayType>;
 extern template class PARQUET_EXPORT TypedColumnReader<FLBAType>;
 
-namespace internal {
-
-void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
-                              int16_t max_definition_level, int16_t max_repetition_level,
-                              int64_t* values_read, int64_t* null_count,
-                              uint8_t* valid_bits, int64_t valid_bits_offset);
-
-}  // namespace internal
+extern template class PARQUET_EXPORT RecordReader<BooleanType>;
+extern template class PARQUET_EXPORT RecordReader<Int32Type>;
+extern template class PARQUET_EXPORT RecordReader<Int64Type>;
+extern template class PARQUET_EXPORT RecordReader<Int96Type>;
+extern template class PARQUET_EXPORT RecordReader<FloatType>;
+extern template class PARQUET_EXPORT RecordReader<DoubleType>;
+extern template class PARQUET_EXPORT RecordReader<ByteArrayType>;
+extern template class PARQUET_EXPORT RecordReader<FLBAType>;
 
 }  // namespace parquet
 

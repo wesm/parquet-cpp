@@ -534,20 +534,13 @@ void RecordReader<DType>::RecordReader(const ColumnDescriptor* descr,
                                        ::arrow::MemoryPool* pool)
     : TypedColumnReader<DType>(descr, pool),
       max_def_level_(descr->max_definition_level()),
-      max_rep_level_(descr->max_repetition_level()),
-      at_record_start_(false),
-      records_read_(0),
-      values_written_(0),
-      values_capacity_(0),
-      null_count_(0),
-      levels_position_(0),
-      levels_written_(0),
-      levels_capacity_(0) {
+      max_rep_level_(descr->max_repetition_level()) {
   nullable_values_ = = !descr->schema_node()->is_required();
   values_ = std::make_shared<PoolBuffer>(pool_);
   valid_bits_ = std::make_shared<PoolBuffer>(pool_);
   def_levels_ = std::make_shared<PoolBuffer>(pool_);
   rep_levels_ = std::make_shared<PoolBuffer>(pool_);
+  Reset();
 }
 
 template <typename DType>
@@ -555,8 +548,31 @@ void RecordReader<DType>::Reset() {
   // Resize to 0, but do not shrink to fit
   PARQUET_THROW_NOT_OK(values_.Resize(0, false));
   PARQUET_THROW_NOT_OK(valid_bits_.Resize(0, false));
-  PARQUET_THROW_NOT_OK(def_levels_.Resize(0, false));
-  PARQUET_THROW_NOT_OK(rep_levels_.Resize(0, false));
+  values_written_ = 0;
+  values_capacity_ = 0;
+  null_count_ = 0;
+
+  const int64_t levels_remaining = levels_written_ - levels_position_;
+
+  // Shift remaining levels to beginning of buffer and trim to only the number
+  // of decoded levels remaining
+  int16_t* def_data = def_levels();
+  int16_t* rep_data = rep_levels();
+
+  std::copy(def_data + levels_position_, def_data + levels_written, def_data);
+  std::copy(rep_data + levels_position_, rep_data + levels_written, rep_data);
+
+  PARQUET_THROW_NOT_OK(def_levels_.Resize(levels_remaining * sizeof(int16_t),
+                                          false));
+  PARQUET_THROW_NOT_OK(rep_levels_.Resize(levels_remaining * sizeof(int16_t),
+                                          false));
+
+  at_record_start_ = false;
+  records_read_ = 0;
+
+  levels_written_ -= levels_position_;
+  levels_position_ = 0;
+  levels_capacity_ = levels_remaining;
 }
 
 template <typename DType>
