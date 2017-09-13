@@ -839,7 +839,7 @@ Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
   auto reader = dynamic_cast<RecordReader<ParquetType>*>(column_reader_.get());
   DCHECK(reader);
 
-  reader->Reserve(batch_size);
+  PARQUET_CATCH_NOT_OK(reader->Reserve(batch_size));
 
   while ((records_to_read > 0) && column_reader_) {
     int64_t values_read;
@@ -853,7 +853,7 @@ Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
   int64_t actual_records = std::min(records_to_read, reader->records_read());
 
   RETURN_NOT_OK(TransferData<ArrowType, ParquetType>(out));
-  reader->Reset();
+  PARQUET_CATCH_NOT_OK(reader->ConsumeRecords());
 
   // Check if we should transform this array into an list array.
   return WrapIntoListArray(out);
