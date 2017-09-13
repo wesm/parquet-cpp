@@ -344,6 +344,45 @@ static std::shared_ptr<GroupNode> MakeSimpleSchema(const ::arrow::DataType& type
   return std::static_pointer_cast<GroupNode>(node_);
 }
 
+void AssertArraysEquals(const Array& expected, const Array& actual) {
+  if (!actual.Equals(expected)) {
+    std::stringstream pp_result;
+    std::stringstream pp_expected;
+
+    EXPECT_OK(::arrow::PrettyPrint(actual, 0, &pp_result));
+    EXPECT_OK(::arrow::PrettyPrint(expected, 0, &pp_expected));
+    FAIL() << "Got: \n" << pp_result.str() << "\nExpected: \n" << pp_expected.str();
+  }
+}
+
+void AssertChunkedEqual(const ChunkedArray& expected, const ChunkedArray& actual) {
+  ASSERT_EQ(expected.num_chunks(), actual.num_chunks()) << "# chunks unequal";
+  if (!actual.Equals(expected)) {
+    std::stringstream pp_result;
+    std::stringstream pp_expected;
+
+    for (int i = 0; i < actual.num_chunks(); ++i) {
+      auto c1 = actual.chunk(i);
+      auto c2 = expected.chunk(i);
+      if (!c1->Equals(*c2)) {
+        EXPECT_OK(::arrow::PrettyPrint(*c1, 0, &pp_result));
+        EXPECT_OK(::arrow::PrettyPrint(*c2, 0, &pp_expected));
+        FAIL() << "Chunk " << i << " Got: " << pp_result.str()
+               << "\nExpected: " << pp_expected.str();
+      }
+    }
+  }
+}
+
+void AssertTablesEqual(const Table& expected, const Table& actual) {
+  ASSERT_EQ(expected.num_columns(), actual.num_columns());
+
+  for (int i = 0; i < actual.num_columns(); ++i) {
+    AssertChunkedEqual(*expected.column(i)->data(), *actual.column(i)->data());
+  }
+  ASSERT_TRUE(actual.Equals(expected));
+}
+
 template <typename TestType>
 class TestParquetIO : public ::testing::Test {
  public:
@@ -372,13 +411,14 @@ class TestParquetIO : public ::testing::Test {
     ASSERT_NE(nullptr, out->get());
   }
 
-  void ReadAndCheckSingleColumnFile(::arrow::Array* values) {
-    std::shared_ptr<::arrow::Array> out;
+  void ReadAndCheckSingleColumnFile(const Array& values) {
+    std::shared_ptr<Array> out;
 
     std::unique_ptr<FileReader> reader;
     ReaderFromSink(&reader);
     ReadSingleColumnFile(std::move(reader), &out);
-    ASSERT_TRUE(values->Equals(out));
+
+    AssertArraysEquals(*out, values);
   }
 
   void ReadTableFromFile(std::unique_ptr<FileReader> reader,
@@ -418,7 +458,7 @@ class TestParquetIO : public ::testing::Test {
     *out = MakeSimpleTable(parent_lists, nullable_parent_lists);
   }
 
-  void ReadAndCheckSingleColumnTable(const std::shared_ptr<::arrow::Array>& values) {
+  void ReadAndCheckSingleColumnTable(const std::shared_ptr<Array>& values) {
     std::shared_ptr<::arrow::Table> out;
     std::unique_ptr<FileReader> reader;
     ReaderFromSink(&reader);
@@ -430,13 +470,14 @@ class TestParquetIO : public ::testing::Test {
     ASSERT_EQ(1, chunked_array->num_chunks());
     auto result = chunked_array->chunk(0);
 
-    ASSERT_TRUE(values->Equals(result));
+    AssertArraysEquals(*result, *values);
   }
 
   void CheckRoundTrip(const std::shared_ptr<Table>& table) {
     std::shared_ptr<Table> result;
     DoSimpleRoundtrip(table, 1, table->num_rows(), {}, &result);
-    ASSERT_TRUE(table->Equals(*result));
+
+    AssertTablesEqual(*table, *result);
   }
 
   template <typename ArrayType>
@@ -473,7 +514,7 @@ TYPED_TEST(TestParquetIO, SingleColumnRequiredWrite) {
       MakeSimpleSchema(*values->type(), Repetition::REQUIRED);
   this->WriteColumn(schema, values);
 
-  this->ReadAndCheckSingleColumnFile(values.get());
+  this->ReadAndCheckSingleColumnFile(*values);
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnTableRequiredWrite) {
@@ -493,7 +534,8 @@ TYPED_TEST(TestParquetIO, SingleColumnTableRequiredWrite) {
 
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
-  ASSERT_TRUE(values->Equals(chunked_array->chunk(0)));
+
+  AssertArraysEquals(*values, *chunked_array->chunk(0));
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnOptionalReadWrite) {
@@ -506,7 +548,7 @@ TYPED_TEST(TestParquetIO, SingleColumnOptionalReadWrite) {
       MakeSimpleSchema(*values->type(), Repetition::OPTIONAL);
   this->WriteColumn(schema, values);
 
-  this->ReadAndCheckSingleColumnFile(values.get());
+  this->ReadAndCheckSingleColumnFile(*values);
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnRequiredSliceWrite) {
@@ -517,12 +559,12 @@ TYPED_TEST(TestParquetIO, SingleColumnRequiredSliceWrite) {
 
   std::shared_ptr<Array> sliced_values = values->Slice(SMALL_SIZE / 2, SMALL_SIZE);
   this->WriteColumn(schema, sliced_values);
-  this->ReadAndCheckSingleColumnFile(sliced_values.get());
+  this->ReadAndCheckSingleColumnFile(*sliced_values);
 
   // Slice offset 1 higher
   sliced_values = values->Slice(SMALL_SIZE / 2 + 1, SMALL_SIZE);
   this->WriteColumn(schema, sliced_values);
-  this->ReadAndCheckSingleColumnFile(sliced_values.get());
+  this->ReadAndCheckSingleColumnFile(*sliced_values);
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnOptionalSliceWrite) {
@@ -533,12 +575,12 @@ TYPED_TEST(TestParquetIO, SingleColumnOptionalSliceWrite) {
 
   std::shared_ptr<Array> sliced_values = values->Slice(SMALL_SIZE / 2, SMALL_SIZE);
   this->WriteColumn(schema, sliced_values);
-  this->ReadAndCheckSingleColumnFile(sliced_values.get());
+  this->ReadAndCheckSingleColumnFile(*sliced_values);
 
   // Slice offset 1 higher, thus different null bitmap.
   sliced_values = values->Slice(SMALL_SIZE / 2 + 1, SMALL_SIZE);
   this->WriteColumn(schema, sliced_values);
-  this->ReadAndCheckSingleColumnFile(sliced_values.get());
+  this->ReadAndCheckSingleColumnFile(*sliced_values);
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnTableOptionalReadWrite) {
@@ -595,7 +637,7 @@ TYPED_TEST(TestParquetIO, SingleColumnRequiredChunkedWrite) {
   }
   ASSERT_OK_NO_THROW(writer.Close());
 
-  this->ReadAndCheckSingleColumnFile(values.get());
+  this->ReadAndCheckSingleColumnFile(*values);
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnTableRequiredChunkedWrite) {
@@ -638,7 +680,8 @@ TYPED_TEST(TestParquetIO, SingleColumnTableRequiredChunkedWriteArrowIO) {
 
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
-  ASSERT_TRUE(values->Equals(chunked_array->chunk(0)));
+
+  AssertArraysEquals(*values, *chunked_array->chunk(0));
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnOptionalChunkedWrite) {
@@ -657,7 +700,7 @@ TYPED_TEST(TestParquetIO, SingleColumnOptionalChunkedWrite) {
   }
   ASSERT_OK_NO_THROW(writer.Close());
 
-  this->ReadAndCheckSingleColumnFile(values.get());
+  this->ReadAndCheckSingleColumnFile(*values);
 }
 
 TYPED_TEST(TestParquetIO, SingleColumnTableOptionalChunkedWrite) {
@@ -722,7 +765,7 @@ TEST_F(TestInt96ParquetIO, ReadIntoTimestamp) {
   ASSERT_OK(builder.Append(val));
   std::shared_ptr<Array> values;
   ASSERT_OK(builder.Finish(&values));
-  this->ReadAndCheckSingleColumnFile(values.get());
+  this->ReadAndCheckSingleColumnFile(*values);
 }
 
 using TestUInt32ParquetIO = TestParquetIO<::arrow::UInt32Type>;
@@ -809,7 +852,8 @@ TEST_F(TestStringParquetIO, EmptyStringColumnRequiredWrite) {
 
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
-  ASSERT_TRUE(values->Equals(chunked_array->chunk(0)));
+
+  AssertArraysEquals(*values, *chunked_array->chunk(0));
 }
 
 using TestNullParquetIO = TestParquetIO<::arrow::NullType>;
@@ -830,7 +874,8 @@ TEST_F(TestNullParquetIO, NullColumn) {
 
   std::shared_ptr<ChunkedArray> chunked_array = out->column(0)->data();
   ASSERT_EQ(1, chunked_array->num_chunks());
-  ASSERT_TRUE(values->Equals(chunked_array->chunk(0)));
+
+  AssertArraysEquals(*values, *chunked_array->chunk(0));
 }
 
 template <typename T>
@@ -985,14 +1030,14 @@ TEST(TestArrowReadWrite, DateTimeTypes) {
       table, 1, table->num_rows(), {}, &result,
       ArrowWriterProperties::Builder().enable_deprecated_int96_timestamps()->build());
 
-  ASSERT_TRUE(table->Equals(*result));
+  AssertTablesEqual(*table, *result);
 
   // Cast nanaoseconds to microseconds and use INT64 physical type
   DoSimpleRoundtrip(table, 1, table->num_rows(), {}, &result);
   std::shared_ptr<Table> expected;
   MakeDateTimeTypesTable(&table, true);
 
-  ASSERT_TRUE(table->Equals(*result));
+  AssertTablesEqual(*table, *result);
 }
 
 TEST(TestArrowReadWrite, CoerceTimestamps) {
@@ -1056,13 +1101,14 @@ TEST(TestArrowReadWrite, CoerceTimestamps) {
   DoSimpleRoundtrip(
       input, 1, input->num_rows(), {}, &milli_result,
       ArrowWriterProperties::Builder().coerce_timestamps(TimeUnit::MILLI)->build());
-  ASSERT_TRUE(milli_result->Equals(*ex_milli_result));
+
+  AssertTablesEqual(*ex_milli_result, *milli_result);
 
   std::shared_ptr<Table> micro_result;
   DoSimpleRoundtrip(
       input, 1, input->num_rows(), {}, &micro_result,
       ArrowWriterProperties::Builder().coerce_timestamps(TimeUnit::MICRO)->build());
-  ASSERT_TRUE(micro_result->Equals(*ex_micro_result));
+  AssertTablesEqual(*ex_micro_result, *micro_result);
 }
 
 TEST(TestArrowReadWrite, CoerceTimestampsLosePrecision) {
@@ -1172,7 +1218,7 @@ TEST(TestArrowReadWrite, ConvertedDateTimeTypes) {
   std::shared_ptr<Table> result;
   DoSimpleRoundtrip(table, 1, table->num_rows(), {}, &result);
 
-  ASSERT_TRUE(result->Equals(*ex_table));
+  AssertTablesEqual(*ex_table, *result);
 }
 
 void MakeDoubleTable(int num_columns, int num_rows, int nchunks,
@@ -1212,7 +1258,7 @@ TEST(TestArrowReadWrite, MultithreadedRead) {
   std::shared_ptr<Table> result;
   DoSimpleRoundtrip(table, num_threads, table->num_rows(), {}, &result);
 
-  ASSERT_TRUE(table->Equals(*result));
+  AssertTablesEqual(*table, *result);
 }
 
 TEST(TestArrowReadWrite, ReadSingleRowGroup) {
@@ -1240,7 +1286,7 @@ TEST(TestArrowReadWrite, ReadSingleRowGroup) {
   std::shared_ptr<Table> concatenated;
   ASSERT_OK(ConcatenateTables({r1, r2}, &concatenated));
 
-  ASSERT_TRUE(table->Equals(*concatenated));
+  AssertTablesEqual(*table, *concatenated);
 }
 
 TEST(TestArrowReadWrite, ScanContents) {
@@ -1287,7 +1333,7 @@ TEST(TestArrowReadWrite, ReadColumnSubset) {
 
   auto ex_schema = std::make_shared<::arrow::Schema>(ex_fields);
   Table expected(ex_schema, ex_columns);
-  ASSERT_TRUE(result->Equals(expected));
+  AssertTablesEqual(expected, *result);
 }
 
 TEST(TestArrowWrite, CheckChunkSize) {
