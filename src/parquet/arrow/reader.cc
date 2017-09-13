@@ -43,6 +43,7 @@ using arrow::Field;
 using arrow::Int32Array;
 using arrow::ListArray;
 using arrow::StructArray;
+using arrow::TimestampArray;
 using arrow::MemoryPool;
 using arrow::PoolBuffer;
 using arrow::Status;
@@ -211,7 +212,7 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::Impl {
   Status NextBatch(int records_to_read, std::shared_ptr<Array>* out) override;
 
   template <typename ArrowType, typename ParquetType>
-  Status TypedReadBatch(int records_to_read, std::shared_ptr<Array>* out);
+  Status TypedReadBatch(int64_t records_to_read, std::shared_ptr<Array>* out);
 
   template <typename ArrowType, typename ParquetType>
   Status WrapIntoListArray(std::shared_ptr<Array>* array);
@@ -707,11 +708,10 @@ template <typename ArrowType, typename ParquetType, typename Enable = void>
 struct TransferFunctor {
   using ArrowCType = typename ArrowType::c_type;
 
-  Status operator()(RecordReader<ParquetType>* reader,
-                    MemoryPool* pool,
+  Status operator()(RecordReader<ParquetType>* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
-    int64_t length = reader->num_values();
+    int64_t length = reader->values_written();
     std::shared_ptr<Buffer> data;
     RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(ArrowCType), &data));
 
@@ -720,8 +720,8 @@ struct TransferFunctor {
 
     if (reader->nullable_values()) {
       std::shared_ptr<PoolBuffer> is_valid = reader->ReleaseIsValid();
-      *out = std::make_shared<ArrayType<ArrowType>>(type, length, data,
-                                                    is_valid, reader->null_count());
+      *out = std::make_shared<ArrayType<ArrowType>>(type, length, data, is_valid,
+                                                    reader->null_count());
     } else {
       *out = std::make_shared<ArrayType<ArrowType>>(type, length, data);
     }
@@ -731,18 +731,17 @@ struct TransferFunctor {
 
 template <typename ArrowType, typename ParquetType>
 struct TransferFunctor<ArrowType, ParquetType,
-                       supports_fast_path<ArrowType, ParquetType>>{
-  Status operator()(RecordReader<ParquetType>* reader,
-                    MemoryPool* pool,
+                       supports_fast_path<ArrowType, ParquetType>> {
+  Status operator()(RecordReader<ParquetType>* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
-    int64_t length = reader->num_values();
+    int64_t length = reader->values_written();
     std::shared_ptr<PoolBuffer> values = reader->ReleaseValues();
 
     if (reader->nullable_values()) {
       std::shared_ptr<PoolBuffer> is_valid = reader->ReleaseIsValid();
-      *out = std::make_shared<ArrayType<ArrowType>>(type, length, values,
-                                                    is_valid, reader->null_count());
+      *out = std::make_shared<ArrayType<ArrowType>>(type, length, values, is_valid,
+                                                    reader->null_count());
     } else {
       *out = std::make_shared<ArrayType<ArrowType>>(type, length, values);
     }
@@ -752,16 +751,15 @@ struct TransferFunctor<ArrowType, ParquetType,
 
 template <>
 struct TransferFunctor<::arrow::BooleanType, BooleanType> {
-  Status operator()(RecordReader<ParquetType>* reader,
-                    MemoryPool* pool,
+  Status operator()(RecordReader<BooleanType>* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
-    int64_t length = reader->num_values();
+    int64_t length = reader->values_written();
     std::shared_ptr<Buffer> data;
     RETURN_NOT_OK(::arrow::AllocateBuffer(pool, BytesForBits(length), &data));
 
     // Transfer boolean values to packed bitmap
-    const bool* values = reader->values_written();
+    const bool* values = reader->values();
     uint8_t* data_ptr = data->mutable_data();
     for (int64_t i = 0; i < length; i++) {
       if (values[i]) {
@@ -783,12 +781,11 @@ struct TransferFunctor<::arrow::BooleanType, BooleanType> {
 
 template <>
 struct TransferFunctor<::arrow::TimestampType, Int96Type> {
-  Status operator()(RecordReader<ParquetType>* reader,
-                    MemoryPool* pool,
+  Status operator()(RecordReader<Int96Type>* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
     int64_t length = reader->values_written();
-    Int96* values = reader->values;
+    Int96* values = reader->values();
 
     std::shared_ptr<Buffer> data;
     RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(int64_t), &data));
@@ -812,13 +809,14 @@ struct TransferFunctor<::arrow::TimestampType, Int96Type> {
 
 template <>
 struct TransferFunctor<::arrow::Date64Type, Int32Type> {
-  Status operator()(RecordReader<ParquetType>* reader,
-                    MemoryPool* pool,
+  Status operator()(RecordReader<Int32Type>* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
-    int64_t length = reader->num_values();
+    int64_t length = reader->values_written();
     std::shared_ptr<Buffer> data;
     RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(int32_t), &data));
+
+    const int32_t* values = reader->values();
 
     auto out_ptr = reinterpret_cast<int32_t*>(data->mutable_data());
     for (int64_t i = 0; i < length; i++) {
@@ -827,10 +825,10 @@ struct TransferFunctor<::arrow::Date64Type, Int32Type> {
 
     if (reader->nullable_values()) {
       std::shared_ptr<PoolBuffer> is_valid = reader->ReleaseIsValid();
-      *out = std::make_shared<ArrayType<ArrowType>>(type, length, data, is_valid,
-                                                    reader->null_count());
+      *out = std::make_shared<Int32Array>(type, length, data, is_valid,
+                                          reader->null_count());
     } else {
-      *out = std::make_shared<ArrayType<ArrowType>>(type, length, data);
+      *out = std::make_shared<Int32Array>(type, length, data);
     }
     return Status::OK();
   }
@@ -838,30 +836,13 @@ struct TransferFunctor<::arrow::Date64Type, Int32Type> {
 
 template <typename ArrowType, typename ParquetType>
 struct TransferFunctor<
-  ArrowType, ParquetType,
-  typename std::enable_if<std::is_same<ParquetType, ByteArrayType>::value ||
-                          std::is_same<ParquetType, FLBAType>::value>::type>> {
-  Status operator()(RecordReader<ParquetType>* reader,
-                    MemoryPool* pool,
+    ArrowType, ParquetType,
+    typename std::enable_if<std::is_same<ParquetType, ByteArrayType>::value ||
+                            std::is_same<ParquetType, FLBAType>::value>::type> {
+  Status operator()(RecordReader<ParquetType>* reader, MemoryPool* pool,
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
-    int64_t length = reader->num_values();
-    std::shared_ptr<Buffer> data;
-    RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(int32_t), &data));
-
-    auto out_ptr = reinterpret_cast<int32_t*>(data->mutable_data());
-    for (int64_t i = 0; i < length; i++) {
-      *out_ptr++ = static_cast<int64_t>(values[i]) * 86400000;
-    }
-
-    if (reader->nullable_values()) {
-      std::shared_ptr<PoolBuffer> is_valid = reader->ReleaseIsValid();
-      *out = std::make_shared<ArrayType<ArrowType>>(type, length, data, is_valid,
-                                                    reader->null_count());
-    } else {
-      *out = std::make_shared<ArrayType<ArrowType>>(type, length, data);
-    }
-    return Status::OK();
+    return reader->builder()->Finish(out);
   }
 };
 
