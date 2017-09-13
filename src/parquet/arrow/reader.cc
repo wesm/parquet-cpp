@@ -50,7 +50,7 @@ using arrow::PoolBuffer;
 using arrow::Status;
 using arrow::Table;
 
-using parquet::schema::NodePtr;
+using parquet::schema::Node;
 
 // Help reduce verbosity
 using ParquetReader = parquet::ParquetFileReader;
@@ -160,7 +160,7 @@ class FileReader::Impl {
   Status ReadSchemaField(int i, std::shared_ptr<Array>* out);
   Status ReadSchemaField(int i, const std::vector<int>& indices,
                          std::shared_ptr<Array>* out);
-  Status GetReaderForNode(int index, const NodePtr& node, const std::vector<int>& indices,
+  Status GetReaderForNode(int index, const Node* node, const std::vector<int>& indices,
                           int16_t def_level,
                           std::unique_ptr<ColumnReader::ColumnReaderImpl>* out);
   Status ReadColumn(int i, std::shared_ptr<Array>* out);
@@ -194,7 +194,7 @@ class FileReader::Impl {
 class ColumnReader::ColumnReaderImpl {
  public:
   virtual ~ColumnReaderImpl() {}
-  virtual Status NextBatch(int batch_size, std::shared_ptr<Array>* out) = 0;
+  virtual Status NextBatch(int records_to_read, std::shared_ptr<Array>* out) = 0;
   virtual Status GetDefLevels(const int16_t** data, size_t* length) = 0;
   virtual Status GetRepLevels(const int16_t** data, size_t* length) = 0;
   virtual const std::shared_ptr<Field> field() = 0;
@@ -205,7 +205,7 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
  public:
   PrimitiveImpl(MemoryPool* pool, std::unique_ptr<FileColumnIterator> input)
       : pool_(pool), input_(std::move(input)), descr_(input_->descr()) {
-    DCHECK(NodeToField(input_->descr()->schema_node(), &field_).ok());
+    DCHECK(NodeToField(input_->descr()->schema_node().get(), &field_).ok());
     NextRowGroup();
 
     record_reader_.reset(new RecordReader(descr_, pool_));
@@ -244,7 +244,7 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
 class PARQUET_NO_EXPORT StructImpl : public ColumnReader::ColumnReaderImpl {
  public:
   explicit StructImpl(const std::vector<std::shared_ptr<ColumnReaderImpl>>& children,
-                      int16_t struct_def_level, MemoryPool* pool, const NodePtr& node)
+                      int16_t struct_def_level, MemoryPool* pool, const Node* node)
       : children_(children),
         struct_def_level_(struct_def_level),
         pool_(pool),
@@ -254,7 +254,7 @@ class PARQUET_NO_EXPORT StructImpl : public ColumnReader::ColumnReaderImpl {
 
   virtual ~StructImpl() {}
 
-  Status NextBatch(int batch_size, std::shared_ptr<Array>* out) override;
+  Status NextBatch(int records_to_read, std::shared_ptr<Array>* out) override;
   Status GetDefLevels(const int16_t** data, size_t* length) override;
   Status GetRepLevels(const int16_t** data, size_t* length) override;
   const std::shared_ptr<Field> field() override { return field_; }
@@ -268,7 +268,7 @@ class PARQUET_NO_EXPORT StructImpl : public ColumnReader::ColumnReaderImpl {
 
   Status DefLevelsToNullArray(std::shared_ptr<Buffer>* null_bitmap,
                               int64_t* null_count);
-  void InitField(const NodePtr& node,
+  void InitField(const Node* node,
                  const std::vector<std::shared_ptr<ColumnReaderImpl>>& children);
 };
 
@@ -287,19 +287,19 @@ Status FileReader::Impl::GetColumn(int i, std::unique_ptr<ColumnReader>* out) {
 }
 
 Status FileReader::Impl::GetReaderForNode(
-    int index, const NodePtr& node, const std::vector<int>& indices, int16_t def_level,
+    int index, const Node* node, const std::vector<int>& indices, int16_t def_level,
     std::unique_ptr<ColumnReader::ColumnReaderImpl>* out) {
   *out = nullptr;
 
   if (IsSimpleStruct(node)) {
-    const schema::GroupNode* group = static_cast<const schema::GroupNode*>(node.get());
+    const schema::GroupNode* group = static_cast<const schema::GroupNode*>(node);
     std::vector<std::shared_ptr<ColumnReader::ColumnReaderImpl>> children;
     for (int i = 0; i < group->field_count(); i++) {
       std::unique_ptr<ColumnReader::ColumnReaderImpl> child_reader;
       // TODO(itaiin): Remove the -1 index hack when all types of nested reads
       // are supported. This currently just signals the lower level reader resolution
       // to abort
-      RETURN_NOT_OK(GetReaderForNode(index, group->field(i), indices, def_level + 1,
+      RETURN_NOT_OK(GetReaderForNode(index, group->field(i).get(), indices, def_level + 1,
                                      &child_reader));
       if (child_reader != nullptr) {
         children.push_back(std::move(child_reader));
@@ -313,16 +313,16 @@ Status FileReader::Impl::GetReaderForNode(
   } else {
     // This should be a flat field case - translate the field index to
     // the correct column index by walking down to the leaf node
-    NodePtr walker = node;
+    const Node* walker = node;
     while (!walker->is_primitive()) {
       DCHECK(walker->is_group());
-      auto group = static_cast<GroupNode*>(walker.get());
+      auto group = static_cast<const GroupNode*>(walker);
       if (group->field_count() != 1) {
         return Status::NotImplemented("lists with structs are not supported.");
       }
-      walker = group->field(0);
+      walker = group->field(0).get();
     }
-    auto column_index = reader_->metadata()->schema()->ColumnIndex(*walker.get());
+    auto column_index = reader_->metadata()->schema()->ColumnIndex(*walker);
 
     // If the index of the column is found then a reader for the coliumn is needed.
     // Otherwise *out keeps the nullptr value.
@@ -350,7 +350,7 @@ Status FileReader::Impl::ReadSchemaField(int i, const std::vector<int>& indices,
                                          std::shared_ptr<Array>* out) {
   auto parquet_schema = reader_->metadata()->schema();
 
-  auto node = parquet_schema->group_node()->field(i);
+  auto node = parquet_schema->group_node()->field(i).get();
   std::unique_ptr<ColumnReader::ColumnReaderImpl> reader_impl;
 
   RETURN_NOT_OK(GetReaderForNode(i, node, indices, 1, &reader_impl));
@@ -361,24 +361,24 @@ Status FileReader::Impl::ReadSchemaField(int i, const std::vector<int>& indices,
 
   std::unique_ptr<ColumnReader> reader(new ColumnReader(std::move(reader_impl)));
 
-  int64_t batch_size = 0;
+  int64_t records_to_read = 0;
   for (int j = 0; j < reader_->metadata()->num_row_groups(); j++) {
-    batch_size += reader_->metadata()->RowGroup(j)->ColumnChunk(i)->num_values();
+    records_to_read += reader_->metadata()->RowGroup(j)->ColumnChunk(i)->num_values();
   }
 
-  return reader->NextBatch(static_cast<int>(batch_size), out);
+  return reader->NextBatch(static_cast<int>(records_to_read), out);
 }
 
 Status FileReader::Impl::ReadColumn(int i, std::shared_ptr<Array>* out) {
   std::unique_ptr<ColumnReader> flat_column_reader;
   RETURN_NOT_OK(GetColumn(i, &flat_column_reader));
 
-  int64_t batch_size = 0;
+  int64_t records_to_read = 0;
   for (int j = 0; j < reader_->metadata()->num_row_groups(); j++) {
-    batch_size += reader_->metadata()->RowGroup(j)->ColumnChunk(i)->num_values();
+    records_to_read += reader_->metadata()->RowGroup(j)->ColumnChunk(i)->num_values();
   }
 
-  return flat_column_reader->NextBatch(static_cast<int>(batch_size), out);
+  return flat_column_reader->NextBatch(static_cast<int>(records_to_read), out);
 }
 
 Status FileReader::Impl::GetSchema(const std::vector<int>& indices,
@@ -405,7 +405,7 @@ Status FileReader::Impl::ReadRowGroup(int row_group_index,
   auto ReadColumnFunc = [&indices, &row_group_index, &schema, &columns, &rg_metadata,
                          this](int i) {
     int column_index = indices[i];
-    int64_t batch_size = rg_metadata->ColumnChunk(column_index)->num_values();
+    int64_t records_to_read = rg_metadata->ColumnChunk(column_index)->num_values();
 
     std::unique_ptr<FileColumnIterator> input(
         new SingleRowGroupIterator(column_index, row_group_index, reader_.get()));
@@ -415,7 +415,8 @@ Status FileReader::Impl::ReadRowGroup(int row_group_index,
     ColumnReader flat_column_reader(std::move(impl));
 
     std::shared_ptr<Array> array;
-    RETURN_NOT_OK(flat_column_reader.NextBatch(static_cast<int>(batch_size), &array));
+    RETURN_NOT_OK(
+        flat_column_reader.NextBatch(static_cast<int>(records_to_read), &array));
     columns[i] = std::make_shared<Column>(schema->field(i), array);
     return Status::OK();
   };
@@ -685,8 +686,8 @@ Status PrimitiveImpl::WrapIntoListArray(std::shared_ptr<Array>* array) {
 
     std::shared_ptr<Array> output(*array);
     for (int64_t j = list_depth - 1; j >= 0; j--) {
-      auto list_type = std::make_shared<::arrow::ListType>(
-          std::make_shared<Field>("item", output->type(), nullable[j + 1]));
+      auto list_type =
+          ::arrow::list(::arrow::field("item", output->type(), nullable[j + 1]));
       output = std::make_shared<::arrow::ListArray>(
           list_type, list_lengths[j], offsets[j], output, valid_bits[j], null_counts[j]);
     }
@@ -874,6 +875,7 @@ struct TransferFunctor<
 template <typename ArrowType, typename ParquetType>
 Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
                                      std::shared_ptr<Array>* out) {
+  PARQUET_CATCH_NOT_OK(record_reader_->Reset());
   PARQUET_CATCH_NOT_OK(record_reader_->Reserve(records_to_read));
 
   while (records_to_read > 0) {
@@ -894,18 +896,15 @@ Status PrimitiveImpl::TypedReadBatch(int64_t records_to_read,
 
   // Check if we should transform this array into an list array.
   RETURN_NOT_OK(WrapIntoListArray<ParquetType>(out));
-
-  PARQUET_CATCH_NOT_OK(record_reader_->Reset());
-
   return Status::OK();
 }
 
-#define TYPED_BATCH_CASE(ENUM, ArrowType, ParquetType)              \
-  case ::arrow::Type::ENUM:                                         \
-    return TypedReadBatch<ArrowType, ParquetType>(batch_size, out); \
+#define TYPED_BATCH_CASE(ENUM, ArrowType, ParquetType)                   \
+  case ::arrow::Type::ENUM:                                              \
+    return TypedReadBatch<ArrowType, ParquetType>(records_to_read, out); \
     break;
 
-Status PrimitiveImpl::NextBatch(int batch_size, std::shared_ptr<Array>* out) {
+Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
   if (!column_reader_) {
     // Exhausted all row groups.
     *out = nullptr;
@@ -914,7 +913,7 @@ Status PrimitiveImpl::NextBatch(int batch_size, std::shared_ptr<Array>* out) {
 
   switch (field_->type()->id()) {
     case ::arrow::Type::NA:
-      *out = std::make_shared<::arrow::NullArray>(batch_size);
+      *out = std::make_shared<::arrow::NullArray>(records_to_read);
       return Status::OK();
       break;
       TYPED_BATCH_CASE(BOOL, ::arrow::BooleanType, BooleanType)
@@ -938,13 +937,13 @@ Status PrimitiveImpl::NextBatch(int batch_size, std::shared_ptr<Array>* out) {
           static_cast<::arrow::TimestampType*>(field_->type().get());
       switch (timestamp_type->unit()) {
         case ::arrow::TimeUnit::MILLI:
-          return TypedReadBatch<::arrow::TimestampType, Int64Type>(batch_size, out);
+          return TypedReadBatch<::arrow::TimestampType, Int64Type>(records_to_read, out);
           break;
         case ::arrow::TimeUnit::MICRO:
-          return TypedReadBatch<::arrow::TimestampType, Int64Type>(batch_size, out);
+          return TypedReadBatch<::arrow::TimestampType, Int64Type>(records_to_read, out);
           break;
         case ::arrow::TimeUnit::NANO:
-          return TypedReadBatch<::arrow::TimestampType, Int96Type>(batch_size, out);
+          return TypedReadBatch<::arrow::TimestampType, Int96Type>(records_to_read, out);
           break;
         default:
           return Status::NotImplemented("TimeUnit not supported");
@@ -979,8 +978,8 @@ ColumnReader::ColumnReader(std::unique_ptr<ColumnReaderImpl> impl)
 
 ColumnReader::~ColumnReader() {}
 
-Status ColumnReader::NextBatch(int batch_size, std::shared_ptr<Array>* out) {
-  return impl_->NextBatch(batch_size, out);
+Status ColumnReader::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
+  return impl_->NextBatch(records_to_read, out);
 }
 
 // StructImpl methods
@@ -1053,21 +1052,21 @@ Status StructImpl::GetDefLevels(const int16_t** data, size_t* length) {
 }
 
 void StructImpl::InitField(
-    const NodePtr& node, const std::vector<std::shared_ptr<ColumnReaderImpl>>& children) {
+    const Node* node, const std::vector<std::shared_ptr<ColumnReaderImpl>>& children) {
   // Make a shallow node to field conversion from the children fields
   std::vector<std::shared_ptr<::arrow::Field>> fields(children.size());
   for (size_t i = 0; i < children.size(); i++) {
     fields[i] = children[i]->field();
   }
-  auto type = std::make_shared<::arrow::StructType>(fields);
-  field_ = std::make_shared<Field>(node->name(), type);
+  auto type = ::arrow::struct_(fields);
+  field_ = ::arrow::field(node->name(), type);
 }
 
 Status StructImpl::GetRepLevels(const int16_t** data, size_t* length) {
   return Status::NotImplemented("GetRepLevels is not implemented for struct");
 }
 
-Status StructImpl::NextBatch(int batch_size, std::shared_ptr<Array>* out) {
+Status StructImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
   std::vector<std::shared_ptr<Array>> children_arrays;
   std::shared_ptr<Buffer> null_bitmap;
   int64_t null_count;
@@ -1076,16 +1075,21 @@ Status StructImpl::NextBatch(int batch_size, std::shared_ptr<Array>* out) {
   for (auto& child : children_) {
     std::shared_ptr<Array> child_array;
 
-    RETURN_NOT_OK(child->NextBatch(batch_size, &child_array));
-
+    RETURN_NOT_OK(child->NextBatch(records_to_read, &child_array));
     children_arrays.push_back(child_array);
   }
 
   RETURN_NOT_OK(DefLevelsToNullArray(&null_bitmap, &null_count));
 
-  *out = std::make_shared<StructArray>(field()->type(), batch_size, children_arrays,
-                                       null_bitmap, null_count);
+  int64_t struct_length = children_arrays[0]->length();
+  for (size_t i = 1; i < children_arrays.size(); ++i) {
+    if (children_arrays[i]->length() != struct_length) {
+      return Status::Invalid("Struct children had different lengths");
+    }
+  }
 
+  *out = std::make_shared<StructArray>(field()->type(), struct_length, children_arrays,
+                                       null_bitmap, null_count);
   return Status::OK();
 }
 

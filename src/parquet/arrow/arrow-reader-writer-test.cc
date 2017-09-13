@@ -1402,7 +1402,6 @@ class TestNestedSchemaRead : public ::testing::TestWithParam<Repetition::type> {
 
   void ValidateColumnArray(const ::arrow::Int32Array& array, size_t expected_nulls) {
     ValidateArray(array, expected_nulls);
-
     int j = 0;
     for (int i = 0; i < values_array_->length(); i++) {
       if (array.IsNull(i)) {
