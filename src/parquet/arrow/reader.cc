@@ -832,21 +832,22 @@ struct TransferFunctor<::arrow::Date64Type, Int32Type> {
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
     int64_t length = reader->values_written();
-    std::shared_ptr<Buffer> data;
-    RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(int32_t), &data));
-
     auto values = reinterpret_cast<const int32_t*>(reader->values());
-    auto out_ptr = reinterpret_cast<int32_t*>(data->mutable_data());
+
+    std::shared_ptr<Buffer> data;
+    RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(int64_t), &data));
+    auto out_ptr = reinterpret_cast<int64_t*>(data->mutable_data());
+
     for (int64_t i = 0; i < length; i++) {
       *out_ptr++ = static_cast<int64_t>(values[i]) * 86400000;
     }
 
     if (reader->nullable_values()) {
       std::shared_ptr<PoolBuffer> is_valid = reader->ReleaseIsValid();
-      *out = std::make_shared<Int32Array>(type, length, data, is_valid,
-                                          reader->null_count());
+      *out = std::make_shared<::arrow::Date64Array>(type, length, data, is_valid,
+                                                    reader->null_count());
     } else {
-      *out = std::make_shared<Int32Array>(type, length, data);
+      *out = std::make_shared<::arrow::Date64Array>(type, length, data);
     }
     return Status::OK();
   }
