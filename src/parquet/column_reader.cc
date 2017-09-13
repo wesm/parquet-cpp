@@ -639,8 +639,6 @@ void RecordReader::Reserve(int64_t capacity) {
     }
     PARQUET_THROW_NOT_OK(
         def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
-    memset(def_levels_->mutable_data() + levels_written_ * sizeof(int16_t), 0,
-           (new_levels_capacity - levels_written_) * sizeof(int16_t));
 
     if (nullable_values_) {
       int64_t nbytes_old = BitUtil::BytesForBits(levels_written_);
@@ -651,8 +649,6 @@ void RecordReader::Reserve(int64_t capacity) {
     if (descr_->max_repetition_level() > 0) {
       PARQUET_THROW_NOT_OK(
           rep_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
-      memset(rep_levels_->mutable_data() + levels_written_ * sizeof(int16_t), 0,
-             (new_levels_capacity - levels_written_) * sizeof(int16_t));
     }
     levels_capacity_ = new_levels_capacity;
   }
