@@ -96,8 +96,6 @@ class PARQUET_EXPORT ColumnReader {
     return true;
   }
 
-  int64_t buffered_values_current_page() const { return num_buffered_values_; }
-
   Type::type type() const { return descr_->physical_type(); }
 
   const ColumnDescriptor* descr() const { return descr_; }
@@ -115,6 +113,18 @@ class PARQUET_EXPORT ColumnReader {
   // Read multiple repetition levels into preallocated memory
   // Returns the number of decoded repetition levels
   int64_t ReadRepetitionLevels(int64_t batch_size, int16_t* levels);
+
+  int64_t available_values_current_page() const {
+    return num_buffered_values_ - num_decoded_values_;
+  }
+
+  void ConsumeBufferedValues(int64_t num_values) {
+    num_decoded_values_ += num_values;
+    if (num_decoded_values_ > num_buffered_values_) {
+      DCHECK(false);
+    }
+    DCHECK_LE(num_decoded_values_, num_buffered_values_);
+  }
 
   const ColumnDescriptor* descr_;
 
@@ -320,7 +330,7 @@ inline int64_t TypedColumnReader<DType>::ReadBatch(int64_t batch_size,
 
   *values_read = ReadValues(values_to_read, values);
   int64_t total_values = std::max(num_def_levels, *values_read);
-  num_decoded_values_ += total_values;
+  ConsumeBufferedValues(total_values);
 
   return total_values;
 }
@@ -410,7 +420,7 @@ inline int64_t TypedColumnReader<DType>::ReadBatchSpaced(
     *levels_read = total_values;
   }
 
-  num_decoded_values_ += *levels_read;
+  ConsumeBufferedValues(*levels_read);
   return total_values;
 }
 
@@ -454,6 +464,9 @@ int64_t TypedColumnReader<DType>::Skip(int64_t num_rows_to_skip) {
 
 /// \brief Stateful column reader that delimits semantic records for both flat
 /// and nested columns
+///
+/// \note API EXPERIMENTAL
+/// \since 1.3.0
 class PARQUET_EXPORT RecordReader {
  public:
   RecordReader(const ColumnDescriptor* descr, ::arrow::MemoryPool* pool);
@@ -528,6 +541,12 @@ class PARQUET_EXPORT RecordReader {
   std::unique_ptr<::arrow::ArrayBuilder> builder_;
 
   std::shared_ptr<::arrow::PoolBuffer> values_;
+
+  template <typename T>
+  T* ValuesHead() {
+    return reinterpret_cast<T*>(values_->mutable_data()) + values_written_;
+  }
+
   std::shared_ptr<::arrow::PoolBuffer> valid_bits_;
   std::shared_ptr<::arrow::PoolBuffer> def_levels_;
   std::shared_ptr<::arrow::PoolBuffer> rep_levels_;
