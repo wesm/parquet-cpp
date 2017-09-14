@@ -52,6 +52,9 @@ using arrow::Table;
 using arrow::TimeUnit;
 using arrow::ArrayVisitor;
 
+using arrow::test::randint;
+using arrow::test::random_is_valid;
+
 using ArrowId = ::arrow::Type;
 using ParquetType = parquet::Type;
 using parquet::schema::GroupNode;
@@ -307,7 +310,7 @@ void DoSimpleRoundtrip(const std::shared_ptr<Table>& table, int num_threads,
                        int64_t row_group_size, const std::vector<int>& column_subset,
                        std::shared_ptr<Table>* out,
                        const std::shared_ptr<ArrowWriterProperties>& arrow_properties =
-                           default_arrow_writer_properties()) {
+                       default_arrow_writer_properties()) {
   std::shared_ptr<Buffer> buffer;
   WriteTableToBuffer(table, num_threads, row_group_size, arrow_properties, &buffer);
 
@@ -1334,6 +1337,68 @@ TEST(TestArrowReadWrite, ReadColumnSubset) {
   auto ex_schema = std::make_shared<::arrow::Schema>(ex_fields);
   Table expected(ex_schema, ex_columns);
   AssertTablesEqual(expected, *result);
+}
+
+void MakeListTable(int num_rows, std::shared_ptr<Table>* out) {
+  ::arrow::Int32Builder offset_builder;
+
+  std::vector<int32_t> length_draws;
+  randint(num_rows, 0, 100, &length_draws);
+
+  std::vector<int32_t> offset_values;
+
+  // Make sure some of them are length 0
+  int64_t total_elements = 0;
+  for (size_t i = 0; i < length_draws.size(); ++i) {
+    if (length_draws[i] < 10) {
+      length_draws[i] = 0;
+    }
+    offset_values.push_back(total_elements);
+    total_elements += length_draws[i];
+  }
+  offset_values.push_back(total_elements);
+
+  std::vector<int8_t> value_draws;
+  randint<int8_t>(total_elements, 0, 100, &value_draws);
+
+  std::vector<bool> is_valid;
+  random_is_valid(total_elements, 0.1, &is_valid);
+
+  std::shared_ptr<Array> values, offsets;
+  ::arrow::ArrayFromVector<::arrow::Int8Type, int8_t>(::arrow::int8(), is_valid,
+                                                      value_draws, &values);
+  ::arrow::ArrayFromVector<::arrow::Int32Type, int32_t>(offset_values, &offsets);
+
+  std::shared_ptr<Array> list_array;
+  ASSERT_OK(::arrow::ListArray::FromArrays(*offsets, *values, default_memory_pool(),
+                                           &list_array));
+
+  auto f1 = ::arrow::field("a", ::arrow::list(::arrow::int8()));
+  auto schema = ::arrow::schema({f1});
+  std::vector<std::shared_ptr<Array>> arrays = {list_array};
+  *out = std::make_shared<Table>(schema, arrays);
+}
+
+TEST(TestArrowReadWrite, ListLargeRecords) {
+  const int num_rows = 50;
+
+  std::shared_ptr<Table> table;
+  MakeListTable(num_rows, &table);
+
+  std::shared_ptr<Buffer> buffer;
+  WriteTableToBuffer(table, 1, 100, default_arrow_writer_properties(),
+                     &buffer);
+
+  std::unique_ptr<FileReader> reader;
+  ASSERT_OK_NO_THROW(OpenFile(std::make_shared<BufferReader>(buffer),
+                              ::arrow::default_memory_pool(),
+                              ::parquet::default_reader_properties(),
+                              nullptr, &reader));
+
+  // Read everything
+  std::shared_ptr<Table> result;
+  ASSERT_OK_NO_THROW(reader->ReadTable(&result));
+  AssertTablesEqual(*table, *result);
 }
 
 TEST(TestArrowWrite, CheckChunkSize) {
