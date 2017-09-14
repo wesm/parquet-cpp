@@ -369,15 +369,18 @@ RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
 
 int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
   // Delimit records, then read values at the end
-  int64_t values_seen = 0;
   int64_t values_to_read = 0;
   int64_t records_read = 0;
 
   const int64_t start_levels_position = levels_position_;
 
   if (levels_position_ < levels_written_) {
-    records_read += DelimitRecords(num_records, &values_seen);
-    values_to_read += values_seen;
+    records_read += DelimitRecords(num_records, &values_to_read);
+  }
+
+  if (values_to_read > 0) {
+    // Read any values before moving on to next data page
+    ReadValues(reader, values_to_read, start_levels_position);
   }
 
   // HasNext invokes ReadNewPage
@@ -401,6 +404,8 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
     /// or observe the desired number of records
     int64_t batch_size =
         std::min(level_batch_size, reader->available_values_current_page());
+
+    const int64_t start_levels_position = levels_position_;
 
     // No more data in column
     if (batch_size == 0) {
@@ -431,48 +436,52 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
 
       levels_written_ += levels_read;
 
-      records_read += DelimitRecords(num_records - records_read, &values_seen);
+      records_read += DelimitRecords(num_records - records_read,
+                                     &values_to_read);
       reader->ConsumeBufferedValues(levels_read);
     } else {
       // No repetition or definition levels
-      batch_size = std::min(num_records - records_read, batch_size);
-      values_seen = batch_size;
+      batch_size = std::min(num_records, batch_size);
+      values_to_read = batch_size;
       records_read += batch_size;
-      reader->ConsumeBufferedValues(values_seen);
+      reader->ConsumeBufferedValues(values_to_read);
     }
 
-    values_to_read += values_seen;
+    // Read any values before moving on to next data page
+    if (values_to_read > 0) {
+      ReadValues(reader, values_to_read, start_levels_position);
+    }
   }
 
+  return records_read;
+}
+
+void RecordReader::ReadValues(ColumnReader* reader,
+                              const int64_t values_to_read,
+                              const int64_t start_levels_position) {
   // Conservative upper bound
+  const int64_t possible_num_values =
+      std::max(values_to_read, levels_position_ - start_levels_position);
+  ReserveValues(possible_num_values);
 
   int64_t null_count = 0;
-  if (values_to_read > 0 || levels_position_ > start_levels_position) {
-    const int64_t possible_num_values =
-        std::max(values_to_read, levels_position_ - start_levels_position);
-    ReserveValues(possible_num_values);
+  if (nullable_values_) {
+    int64_t implied_values_read = 0;
+    internal::DefinitionLevelsToBitmap(
+        def_levels() + start_levels_position,
+        levels_position_ - start_levels_position,
+        max_def_level_, max_rep_level_,
+        &implied_values_read, &null_count,
+        valid_bits_->mutable_data(),
+        values_written_);
 
-    if (nullable_values_) {
-      int64_t implied_values_read = 0;
-      uint8_t* valid_bits = valid_bits_->mutable_data();
-      const int64_t valid_bits_offset = values_written_;
-
-      internal::DefinitionLevelsToBitmap(
-          this->def_levels() + start_levels_position,
-          levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
-          &implied_values_read, &null_count, valid_bits, valid_bits_offset);
-
-      ReadValuesSpaced(reader, values_to_read + null_count, null_count);
-    } else {
-      ReadValues(reader, values_to_read);
-    }
+    ReadValuesSpaced(reader, values_to_read + null_count, null_count);
+  } else {
+    ReadValuesDense(reader, values_to_read);
   }
-
   // Total values, including null spaces, if any
   values_written_ += values_to_read + null_count;
   null_count_ += null_count;
-
-  return records_read;
 }
 
 int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) {
@@ -526,7 +535,7 @@ int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) 
   return records_read;
 }
 
-void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
+void RecordReader::ReadValuesDense(ColumnReader* reader, int64_t values_to_read) {
   int64_t actual_read = 0;
 
 #define READ_PRIMITIVE(PARQUET_TYPE)                                           \
@@ -580,6 +589,9 @@ void RecordReader::ReadValues(ColumnReader* reader, int64_t values_to_read) {
 
 #undef READ_PRIMITIVE
 
+  if (actual_read != values_to_read) {
+    DCHECK(false);
+  }
   DCHECK_EQ(actual_read, values_to_read);
 }
 

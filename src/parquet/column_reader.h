@@ -558,9 +558,12 @@ class PARQUET_EXPORT RecordReader {
   std::shared_ptr<::arrow::PoolBuffer> def_levels_;
   std::shared_ptr<::arrow::PoolBuffer> rep_levels_;
 
+  void ReadValues(ColumnReader* reader, const int64_t values_to_read,
+                  const int64_t start_levels_position);
+
   void ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read, int64_t null_count);
 
-  void ReadValues(ColumnReader* reader, int64_t values_to_read);
+  void ReadValuesDense(ColumnReader* reader, int64_t values_to_read);
 
   // Process written repetition/definition levels to reach the end of
   // records. Process no more levels than necessary to delimit the indicated
