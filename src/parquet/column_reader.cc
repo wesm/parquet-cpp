@@ -285,57 +285,6 @@ std::shared_ptr<ColumnReader> ColumnReader::Make(const ColumnDescriptor* descr,
   return std::shared_ptr<ColumnReader>(nullptr);
 }
 
-namespace internal {
-
-void DefinitionLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
-                              int16_t max_definition_level, int16_t max_repetition_level,
-                              int64_t* values_read, int64_t* null_count,
-                              uint8_t* valid_bits, int64_t valid_bits_offset) {
-  int64_t byte_offset = valid_bits_offset / 8;
-  int64_t bit_offset = valid_bits_offset % 8;
-  uint8_t bitset = valid_bits[byte_offset];
-
-  // TODO(itaiin): As an interim solution we are splitting the code path here
-  // between repeated+flat column reads, and non-repeated+nested reads.
-  // Those paths need to be merged in the future
-  for (int i = 0; i < num_def_levels; ++i) {
-    if (def_levels[i] == max_definition_level) {
-      bitset |= (1 << bit_offset);
-    } else if (max_repetition_level > 0) {
-      // repetition+flat case
-      if (def_levels[i] == (max_definition_level - 1)) {
-        bitset &= ~(1 << bit_offset);
-        *null_count += 1;
-      } else {
-        continue;
-      }
-    } else {
-      // non-repeated+nested case
-      if (def_levels[i] < max_definition_level) {
-        bitset &= ~(1 << bit_offset);
-        *null_count += 1;
-      } else {
-        throw ParquetException("definition level exceeds maximum");
-      }
-    }
-
-    bit_offset++;
-    if (bit_offset == 8) {
-      bit_offset = 0;
-      valid_bits[byte_offset] = bitset;
-      byte_offset++;
-      // TODO: Except for the last byte, this shouldn't be needed
-      bitset = valid_bits[byte_offset];
-    }
-  }
-  if (bit_offset != 0) {
-    valid_bits[byte_offset] = bitset;
-  }
-  *values_read = (bit_offset + byte_offset * 8 - valid_bits_offset);
-}
-
-}  // namespace internal
-
 // ----------------------------------------------------------------------
 
 RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
@@ -508,17 +457,12 @@ int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) 
     }
   } else {
     if (max_def_level_ > 0) {
-      while (levels_position_ < levels_written_) {
-        if (records_read == num_records) {
-          // We've found the number of records we were looking for
-          break;
-        } else {
-          // Continue
-          ++records_read;
-        }
+      while (levels_position_ < levels_written_ &&
+             records_read < num_records) {
         if (def_levels[levels_position_] == max_def_level_) {
           ++values_to_read;
         }
+        ++records_read;
         ++levels_position_;
       }
     } else {
