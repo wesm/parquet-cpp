@@ -47,7 +47,7 @@ class PARQUET_EXPORT RecordReader {
   class RecordReaderImpl;
 
   static std::shared_ptr<RecordReader> Make(
-      const ColumnDescriptor* descr, std::unique_ptr<PageReader> pager,
+      const ColumnDescriptor* descr,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   virtual ~RecordReader();
@@ -70,6 +70,10 @@ class PARQUET_EXPORT RecordReader {
   int64_t levels_written() const;
   int64_t null_count() const;
   bool nullable_values() const;
+
+  bool HasMoreData() const;
+
+  void SetPageReader(std::unique_ptr<PageReader> reader);
 
  private:
   std::unique_ptr<RecordReaderImpl> impl_;

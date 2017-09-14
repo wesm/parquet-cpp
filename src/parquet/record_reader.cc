@@ -51,11 +51,9 @@ static bool IsDictionaryIndexEncoding(const Encoding::type& e) {
 
 class RecordReader::RecordReaderImpl {
  public:
-  RecordReaderImpl(const ColumnDescriptor* descr,
-                   std::unique_ptr<PageReader> pager, MemoryPool* pool)
+  RecordReaderImpl(const ColumnDescriptor* descr, MemoryPool* pool)
       : descr_(descr),
         pool_(pool),
-        pager_(std::move(pager)),
         num_buffered_values_(0),
         num_decoded_values_(0),
         max_def_level_(descr->max_definition_level()),
@@ -88,6 +86,16 @@ class RecordReader::RecordReaderImpl {
 
   virtual int64_t ReadRecords(int64_t num_records) = 0;
 
+  // Dictionary decoders must be reset when advancing row groups
+  virtual void ResetDecoders() = 0;
+
+  void SetPageReader(std::unique_ptr<PageReader> reader) {
+    pager_ = std::move(reader);
+    ResetDecoders();
+  }
+
+  bool HasMoreData() const { return pager_ != nullptr; }
+
   int16_t* def_levels() const {
     return reinterpret_cast<int16_t*>(def_levels_->mutable_data());
   }
@@ -96,9 +104,7 @@ class RecordReader::RecordReaderImpl {
     return reinterpret_cast<int16_t*>(rep_levels_->mutable_data());
   }
 
-  uint8_t* values() const {
-    return values_->mutable_data();
-  }
+  uint8_t* values() const { return values_->mutable_data(); }
 
   /// \brief Number of values written including nulls (if any)
   int64_t values_written() const { return values_written_; }
@@ -126,9 +132,7 @@ class RecordReader::RecordReaderImpl {
     return result;
   }
 
-  ::arrow::ArrayBuilder* builder() {
-    return builder_.get();
-  }
+  ::arrow::ArrayBuilder* builder() { return builder_.get(); }
 
   // Returns true if there are still values in this column.
   bool HasNext() {
@@ -176,8 +180,7 @@ class RecordReader::RecordReaderImpl {
       }
     } else {
       if (max_def_level_ > 0) {
-        while (levels_position_ < levels_written_ &&
-               records_read < num_records) {
+        while (levels_position_ < levels_written_ && records_read < num_records) {
           if (def_levels[levels_position_] == max_def_level_) {
             ++values_to_read;
           }
@@ -275,8 +278,10 @@ class RecordReader::RecordReaderImpl {
       std::copy(def_data + levels_position_, def_data + levels_written_, def_data);
       std::copy(rep_data + levels_position_, rep_data + levels_written_, rep_data);
 
-      PARQUET_THROW_NOT_OK(def_levels_->Resize(levels_remaining * sizeof(int16_t), false));
-      PARQUET_THROW_NOT_OK(rep_levels_->Resize(levels_remaining * sizeof(int16_t), false));
+      PARQUET_THROW_NOT_OK(
+          def_levels_->Resize(levels_remaining * sizeof(int16_t), false));
+      PARQUET_THROW_NOT_OK(
+          rep_levels_->Resize(levels_remaining * sizeof(int16_t), false));
 
       levels_written_ -= levels_position_;
       levels_position_ = 0;
@@ -364,10 +369,10 @@ class TypedRecordReader : public RecordReader::RecordReaderImpl {
 
   ~TypedRecordReader() {}
 
-  TypedRecordReader(const ColumnDescriptor* schema, std::unique_ptr<PageReader> pager,
-                    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool())
-      : RecordReader::RecordReaderImpl(schema, std::move(pager), pool),
-        current_decoder_(NULL) {}
+  TypedRecordReader(const ColumnDescriptor* schema, ::arrow::MemoryPool* pool)
+      : RecordReader::RecordReaderImpl(schema, pool), current_decoder_(NULL) {}
+
+  void ResetDecoders() override { decoders_.clear(); }
 
   void ReadValuesSpaced(int64_t values_to_read, int64_t null_count);
   void ReadValuesDense(int64_t values_to_read);
@@ -375,7 +380,7 @@ class TypedRecordReader : public RecordReader::RecordReaderImpl {
   void ReadValues(const int64_t values_to_read, const int64_t start_levels_position) {
     // Conservative upper bound
     const int64_t possible_num_values =
-      std::max(values_to_read, levels_position_ - start_levels_position);
+        std::max(values_to_read, levels_position_ - start_levels_position);
     ReserveValues(possible_num_values);
 
     int64_t null_count = 0;
@@ -442,8 +447,7 @@ class TypedRecordReader : public RecordReader::RecordReaderImpl {
 
       /// We perform multiple batch reads until we either exhaust the row group
       /// or observe the desired number of records
-      int64_t batch_size =
-        std::min(level_batch_size, available_values_current_page());
+      int64_t batch_size = std::min(level_batch_size, available_values_current_page());
 
       const int64_t start_levels_position = levels_position_;
 
@@ -511,19 +515,18 @@ class TypedRecordReader : public RecordReader::RecordReaderImpl {
   void ConfigureDictionary(const DictionaryPage* page);
 };
 
-
 template <typename DType>
 inline void TypedRecordReader<DType>::ReadValuesDense(int64_t values_to_read) {
-  int64_t num_decoded = current_decoder_->Decode(ValuesHead<T>(),
-                                                 static_cast<int>(values_to_read));
+  int64_t num_decoded =
+      current_decoder_->Decode(ValuesHead<T>(), static_cast<int>(values_to_read));
   DCHECK_EQ(num_decoded, values_to_read);
 }
 
 template <>
 inline void TypedRecordReader<ByteArrayType>::ReadValuesDense(int64_t values_to_read) {
   auto values = ValuesHead<ByteArray>();
-  int64_t num_decoded = current_decoder_->Decode(values,
-                                                 static_cast<int>(values_to_read));
+  int64_t num_decoded =
+      current_decoder_->Decode(values, static_cast<int>(values_to_read));
   DCHECK_EQ(num_decoded, values_to_read);
 
   auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
@@ -537,8 +540,8 @@ inline void TypedRecordReader<ByteArrayType>::ReadValuesDense(int64_t values_to_
 template <>
 inline void TypedRecordReader<FLBAType>::ReadValuesDense(int64_t values_to_read) {
   auto values = ValuesHead<FLBA>();
-  int64_t num_decoded = current_decoder_->Decode(values,
-                                                 static_cast<int>(values_to_read));
+  int64_t num_decoded =
+      current_decoder_->Decode(values, static_cast<int>(values_to_read));
   DCHECK_EQ(num_decoded, values_to_read);
 
   auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
@@ -555,8 +558,8 @@ inline void TypedRecordReader<DType>::ReadValuesSpaced(int64_t values_to_read,
   const int64_t valid_bits_offset = values_written_;
 
   int64_t num_decoded = current_decoder_->DecodeSpaced(
-      ValuesHead<T>(), static_cast<int>(values_to_read),
-      static_cast<int>(null_count), valid_bits, valid_bits_offset);
+      ValuesHead<T>(), static_cast<int>(values_to_read), static_cast<int>(null_count),
+      valid_bits, valid_bits_offset);
   DCHECK_EQ(num_decoded, values_to_read);
 }
 
@@ -568,8 +571,8 @@ inline void TypedRecordReader<ByteArrayType>::ReadValuesSpaced(int64_t values_to
   auto values = ValuesHead<ByteArray>();
 
   int64_t num_decoded = current_decoder_->DecodeSpaced(
-      values, static_cast<int>(values_to_read),
-      static_cast<int>(null_count), valid_bits, valid_bits_offset);
+      values, static_cast<int>(values_to_read), static_cast<int>(null_count), valid_bits,
+      valid_bits_offset);
   DCHECK_EQ(num_decoded, values_to_read);
 
   auto builder = static_cast<::arrow::BinaryBuilder*>(builder_.get());
@@ -593,8 +596,8 @@ inline void TypedRecordReader<FLBAType>::ReadValuesSpaced(int64_t values_to_read
   auto values = ValuesHead<FLBA>();
 
   int64_t num_decoded = current_decoder_->DecodeSpaced(
-      values, static_cast<int>(values_to_read),
-      static_cast<int>(null_count), valid_bits, valid_bits_offset);
+      values, static_cast<int>(values_to_read), static_cast<int>(null_count), valid_bits,
+      valid_bits_offset);
   DCHECK_EQ(num_decoded, values_to_read);
 
   auto builder = static_cast<::arrow::FixedSizeBinaryBuilder*>(builder_.get());
@@ -742,33 +745,32 @@ bool TypedRecordReader<DType>::ReadNewPage() {
 }
 
 std::shared_ptr<RecordReader> RecordReader::Make(const ColumnDescriptor* descr,
-                                                 std::unique_ptr<PageReader> pager,
                                                  MemoryPool* pool) {
   switch (descr->physical_type()) {
     case Type::BOOLEAN:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<BooleanType>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<BooleanType>(descr, pool)));
     case Type::INT32:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<Int32Type>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<Int32Type>(descr, pool)));
     case Type::INT64:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<Int64Type>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<Int64Type>(descr, pool)));
     case Type::INT96:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<Int96Type>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<Int96Type>(descr, pool)));
     case Type::FLOAT:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<FloatType>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<FloatType>(descr, pool)));
     case Type::DOUBLE:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<DoubleType>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<DoubleType>(descr, pool)));
     case Type::BYTE_ARRAY:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<ByteArrayType>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<ByteArrayType>(descr, pool)));
     case Type::FIXED_LEN_BYTE_ARRAY:
-      return std::shared_ptr<RecordReader>(new RecordReader(
-          new TypedRecordReader<FLBAType>(descr, std::move(pager), pool)));
+      return std::shared_ptr<RecordReader>(
+          new RecordReader(new TypedRecordReader<FLBAType>(descr, pool)));
     default:
       DCHECK(false);
   }
@@ -779,9 +781,7 @@ std::shared_ptr<RecordReader> RecordReader::Make(const ColumnDescriptor* descr,
 // ----------------------------------------------------------------------
 // Implement public API
 
-RecordReader::RecordReader(RecordReaderImpl* impl) {
-  impl_.reset(impl);
-}
+RecordReader::RecordReader(RecordReaderImpl* impl) { impl_.reset(impl); }
 
 RecordReader::~RecordReader() {}
 
@@ -789,21 +789,13 @@ int64_t RecordReader::ReadRecords(int64_t num_records) {
   return impl_->ReadRecords(num_records);
 }
 
-void RecordReader::Reset() {
-  return impl_->Reset();
-}
+void RecordReader::Reset() { return impl_->Reset(); }
 
-const int16_t* RecordReader::def_levels() const {
-  return impl_->def_levels();
-}
+const int16_t* RecordReader::def_levels() const { return impl_->def_levels(); }
 
-const int16_t* RecordReader::rep_levels() const {
-  return impl_->rep_levels();
-}
+const int16_t* RecordReader::rep_levels() const { return impl_->rep_levels(); }
 
-const uint8_t* RecordReader::values() const {
-  return impl_->values();
-}
+const uint8_t* RecordReader::values() const { return impl_->values(); }
 
 std::shared_ptr<PoolBuffer> RecordReader::ReleaseValues() {
   return impl_->ReleaseValues();
@@ -813,28 +805,22 @@ std::shared_ptr<PoolBuffer> RecordReader::ReleaseIsValid() {
   return impl_->ReleaseIsValid();
 }
 
-::arrow::ArrayBuilder* RecordReader::builder() {
-  return impl_->builder();
-}
+::arrow::ArrayBuilder* RecordReader::builder() { return impl_->builder(); }
 
-int64_t RecordReader::values_written() const {
-  return impl_->values_written();
-}
+int64_t RecordReader::values_written() const { return impl_->values_written(); }
 
-int64_t RecordReader::levels_position() const {
-  return impl_->levels_position();
-}
+int64_t RecordReader::levels_position() const { return impl_->levels_position(); }
 
-int64_t RecordReader::levels_written() const {
-  return impl_->levels_written();
-}
+int64_t RecordReader::levels_written() const { return impl_->levels_written(); }
 
-int64_t RecordReader::null_count() const {
-  return impl_->null_count();
-}
+int64_t RecordReader::null_count() const { return impl_->null_count(); }
 
-bool RecordReader::nullable_values() const {
-  return impl_->nullable_values();
+bool RecordReader::nullable_values() const { return impl_->nullable_values(); }
+
+bool RecordReader::HasMoreData() const { return impl_->HasMoreData(); }
+
+void RecordReader::SetPageReader(std::unique_ptr<PageReader> reader) {
+  impl_->SetPageReader(std::move(reader));
 }
 
 }  // namespace parquet

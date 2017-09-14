@@ -144,9 +144,8 @@ class PARQUET_EXPORT ColumnReader {
 namespace internal {
 
 static inline void DefinitionLevelsToBitmap(
-    const int16_t* def_levels, int64_t num_def_levels,
-    int16_t max_definition_level, int16_t max_repetition_level,
-    int64_t* values_read, int64_t* null_count,
+    const int16_t* def_levels, int64_t num_def_levels, int16_t max_definition_level,
+    int16_t max_repetition_level, int64_t* values_read, int64_t* null_count,
     uint8_t* valid_bits, int64_t valid_bits_offset) {
   int64_t byte_offset = valid_bits_offset / 8;
   int64_t bit_offset = valid_bits_offset % 8;

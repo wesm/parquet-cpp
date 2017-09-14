@@ -87,7 +87,7 @@ class FileColumnIterator {
 
   virtual ~FileColumnIterator() {}
 
-  virtual std::shared_ptr<::parquet::RecordReader> Next() = 0;
+  virtual std::unique_ptr<::parquet::PageReader> NextChunk() = 0;
 
   const SchemaDescriptor* schema() const { return schema_; }
 
@@ -108,10 +108,10 @@ class AllRowGroupsIterator : public FileColumnIterator {
   explicit AllRowGroupsIterator(int column_index, ParquetFileReader* reader)
       : FileColumnIterator(column_index, reader), next_row_group_(0) {}
 
-  std::shared_ptr<::parquet::RecordReader> Next() override {
-    std::shared_ptr<::parquet::RecordReader> result;
+  std::unique_ptr<::parquet::PageReader> NextChunk() override {
+    std::unique_ptr<::parquet::PageReader> result;
     if (next_row_group_ < reader_->metadata()->num_row_groups()) {
-      result = reader_->RowGroup(next_row_group_)->GetRecordReader(column_index_);
+      result = reader_->RowGroup(next_row_group_)->GetColumnPageReader(column_index_);
       next_row_group_++;
     } else {
       result = nullptr;
@@ -131,12 +131,13 @@ class SingleRowGroupIterator : public FileColumnIterator {
         row_group_number_(row_group_number),
         done_(false) {}
 
-  std::shared_ptr<::parquet::RecordReader> Next() override {
+  std::unique_ptr<::parquet::PageReader> NextChunk() override {
     if (done_) {
       return nullptr;
     }
 
-    auto result = reader_->RowGroup(row_group_number_)->GetRecordReader(column_index_);
+    auto result =
+        reader_->RowGroup(row_group_number_)->GetColumnPageReader(column_index_);
     done_ = true;
     return result;
   };
@@ -205,6 +206,7 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
  public:
   PrimitiveImpl(MemoryPool* pool, std::unique_ptr<FileColumnIterator> input)
       : pool_(pool), input_(std::move(input)), descr_(input_->descr()) {
+    record_reader_ = RecordReader::Make(descr_, pool_);
     DCHECK(NodeToField(input_->descr()->schema_node().get(), &field_).ok());
     NextRowGroup();
   }
@@ -878,7 +880,7 @@ struct TransferFunctor<
   } break;
 
 Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
-  if (!record_reader_) {
+  if (!record_reader_->HasMoreData()) {
     // Exhausted all row groups.
     *out = nullptr;
     return Status::OK();
@@ -892,7 +894,7 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
   try {
     record_reader_->Reset();
     while (records_to_read > 0) {
-      if (!record_reader_) {
+      if (!record_reader_->HasMoreData()) {
         break;
       }
       int64_t records_read = record_reader_->ReadRecords(records_to_read);
@@ -949,7 +951,10 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
   return Status::OK();
 }
 
-void PrimitiveImpl::NextRowGroup() { record_reader_ = input_->Next(); }
+void PrimitiveImpl::NextRowGroup() {
+  std::unique_ptr<PageReader> page_reader = input_->NextChunk();
+  record_reader_->SetPageReader(std::move(page_reader));
+}
 
 Status PrimitiveImpl::GetDefLevels(const int16_t** data, size_t* length) {
   *data = record_reader_->def_levels();
