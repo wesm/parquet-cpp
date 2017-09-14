@@ -357,6 +357,8 @@ Status FileReader::Impl::ReadSchemaField(int i, const std::vector<int>& indices,
 
   std::unique_ptr<ColumnReader> reader(new ColumnReader(std::move(reader_impl)));
 
+  // TODO(wesm): This calculation doesn't make much sense when we have repeated
+  // schema nodes
   int64_t records_to_read = 0;
   for (int j = 0; j < reader_->metadata()->num_row_groups(); j++) {
     records_to_read += reader_->metadata()->RowGroup(j)->ColumnChunk(i)->num_values();
@@ -891,20 +893,21 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
     return Status::OK();
   }
 
-  PARQUET_CATCH_NOT_OK(record_reader_->Reset());
-  PARQUET_CATCH_NOT_OK(record_reader_->Reserve(records_to_read));
-
-  while (records_to_read > 0) {
-    if (!column_reader_) {
-      break;
+  try {
+    record_reader_->Reset();
+    while (records_to_read > 0) {
+      if (!column_reader_) {
+        break;
+      }
+      int64_t records_read =
+          record_reader_->ReadRecords(column_reader_.get(), records_to_read);
+      records_to_read -= records_read;
+      if (records_read == 0) {
+        NextRowGroup();
+      }
     }
-
-    int64_t records_read =
-        record_reader_->ReadRecords(column_reader_.get(), records_to_read);
-    records_to_read -= records_read;
-    if (!column_reader_->HasNext()) {
-      NextRowGroup();
-    }
+  } catch (const ::parquet::ParquetException& e) {
+    return ::arrow::Status::IOError(e.what());
   }
 
   switch (field_->type()->id()) {
@@ -947,6 +950,7 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
       ss << "No support for reading columns of type " << field_->type()->ToString();
       return Status::NotImplemented(ss.str());
   }
+
   return Status::OK();
 }
 

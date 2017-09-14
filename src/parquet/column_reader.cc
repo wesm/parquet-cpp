@@ -368,24 +368,25 @@ RecordReader::RecordReader(const ColumnDescriptor* descr, MemoryPool* pool)
 }
 
 int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
-  // HasNext invokes ReadNewPage
-  if (!reader->HasNext()) {
-    return 0;
-  }
-
-  const int64_t start_levels_position = levels_position_;
-
   // Delimit records, then read values at the end
   int64_t values_seen = 0;
   int64_t values_to_read = 0;
   int64_t records_read = 0;
+
+  const int64_t start_levels_position = levels_position_;
 
   if (levels_position_ < levels_written_) {
     records_read += DelimitRecords(num_records, &values_seen);
     values_to_read += values_seen;
   }
 
-  DCHECK_EQ(levels_position_, levels_written_);
+  // HasNext invokes ReadNewPage
+  if (records_read == 0 && !reader->HasNext()) {
+    return 0;
+  }
+
+  constexpr int64_t kLevelBatchSize = 1024;
+  int64_t level_batch_size = std::max(kLevelBatchSize, num_records);
 
   // If we are in the middle of a record, we continue until reaching the
   // desired number of records or the end of the current record if we've found
@@ -399,50 +400,58 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
     /// We perform multiple batch reads until we either exhaust the row group
     /// or observe the desired number of records
     int64_t batch_size =
-        std::min(num_records - records_read, reader->available_values_current_page());
+        std::min(level_batch_size, reader->available_values_current_page());
 
     // No more data in column
     if (batch_size == 0) {
       break;
     }
 
-    Reserve(batch_size);
-
-    int16_t* def_levels = this->def_levels() + levels_written_;
-    int16_t* rep_levels = this->rep_levels() + levels_written_;
-
-    // Not present for non-repeated fields
-    int64_t levels_read = 0;
-    if (max_rep_level_ > 0) {
-      levels_read = reader->ReadDefinitionLevels(batch_size, def_levels);
-      if (reader->ReadRepetitionLevels(batch_size, rep_levels) != levels_read) {
-        throw ParquetException("Number of decoded rep / def levels did not match");
-      }
-    } else if (max_def_level_ > 0) {
-      levels_read = reader->ReadDefinitionLevels(batch_size, def_levels);
-    }
-
-    levels_written_ += levels_read;
-
     if (max_def_level_ > 0) {
+      ReserveLevels(batch_size);
+
+      int16_t* def_levels = this->def_levels() + levels_written_;
+      int16_t* rep_levels = this->rep_levels() + levels_written_;
+
+      // Not present for non-repeated fields
+      int64_t levels_read = 0;
+      if (max_rep_level_ > 0) {
+        levels_read = reader->ReadDefinitionLevels(batch_size, def_levels);
+        if (reader->ReadRepetitionLevels(batch_size, rep_levels) != levels_read) {
+          throw ParquetException("Number of decoded rep / def levels did not match");
+        }
+      } else if (max_def_level_ > 0) {
+        levels_read = reader->ReadDefinitionLevels(batch_size, def_levels);
+      }
+
+      // Exhausted column chunk
+      if (levels_read == 0) {
+        break;
+      }
+
+      levels_written_ += levels_read;
+
       records_read += DelimitRecords(num_records - records_read, &values_seen);
+      reader->ConsumeBufferedValues(levels_read);
     } else {
+      // No repetition or definition levels
+      batch_size = std::min(num_records - records_read, batch_size);
       values_seen = batch_size;
       records_read += batch_size;
+      reader->ConsumeBufferedValues(values_seen);
     }
+
     values_to_read += values_seen;
-
-    // This advanced whether or not there are definition levels
-    reader->ConsumeBufferedValues(std::max(values_seen, levels_read));
-
-    // Exhausted column chunk
-    if (levels_read == 0) {
-      break;
-    }
   }
+
+  // Conservative upper bound
 
   int64_t null_count = 0;
   if (values_to_read > 0 || levels_position_ > start_levels_position) {
+    const int64_t possible_num_values =
+        std::max(values_to_read, levels_position_ - start_levels_position);
+    ReserveValues(possible_num_values);
+
     if (nullable_values_) {
       int64_t implied_values_read = 0;
       uint8_t* valid_bits = valid_bits_->mutable_data();
@@ -452,6 +461,7 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
           this->def_levels() + start_levels_position,
           levels_position_ - start_levels_position, max_def_level_, max_rep_level_,
           &implied_values_read, &null_count, valid_bits, valid_bits_offset);
+
       ReadValuesSpaced(reader, values_to_read + null_count, null_count);
     } else {
       ReadValues(reader, values_to_read);
@@ -474,24 +484,38 @@ int64_t RecordReader::DelimitRecords(int64_t num_records, int64_t* values_seen) 
 
   if (max_rep_level_ > 0) {
     // Count logical records and number of values to read
-    for (; levels_position_ < levels_written_; ++levels_position_) {
-      if (def_levels[levels_position_] == max_def_level_) {
-        ++values_to_read;
-      }
+    while (levels_position_ < levels_written_) {
       if (rep_levels[levels_position_] == 0) {
-        ++records_read;
         at_record_start_ = true;
+        if (records_read == num_records) {
+          // We've found the number of records we were looking for
+          break;
+        } else {
+          // Continue
+          ++records_read;
+        }
       } else {
         at_record_start_ = false;
       }
+      if (def_levels[levels_position_] == max_def_level_) {
+        ++values_to_read;
+      }
+      ++levels_position_;
     }
   } else {
     if (max_def_level_ > 0) {
-      for (; levels_position_ < levels_written_; ++levels_position_) {
+      while (levels_position_ < levels_written_) {
+        if (records_read == num_records) {
+          // We've found the number of records we were looking for
+          break;
+        } else {
+          // Continue
+          ++records_read;
+        }
         if (def_levels[levels_position_] == max_def_level_) {
           ++values_to_read;
         }
-        ++records_read;
+        ++levels_position_;
       }
     } else {
       values_to_read = num_records;
@@ -630,7 +654,7 @@ void RecordReader::ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read
   DCHECK_EQ(actual_read, values_to_read);
 }
 
-void RecordReader::Reserve(int64_t capacity) {
+void RecordReader::ReserveLevels(int64_t capacity) {
   if (descr_->max_definition_level() > 0 &&
       (levels_written_ + capacity > levels_capacity_)) {
     int64_t new_levels_capacity = BitUtil::NextPower2(levels_capacity_ + 1);
@@ -639,19 +663,15 @@ void RecordReader::Reserve(int64_t capacity) {
     }
     PARQUET_THROW_NOT_OK(
         def_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
-
-    if (nullable_values_) {
-      int64_t nbytes_old = BitUtil::BytesForBits(levels_written_);
-      int64_t nbytes_new = BitUtil::BytesForBits(new_levels_capacity);
-      PARQUET_THROW_NOT_OK(valid_bits_->Resize(nbytes_new, false));
-      memset(valid_bits_->mutable_data() + nbytes_old, 0, nbytes_new - nbytes_old);
-    }
     if (descr_->max_repetition_level() > 0) {
       PARQUET_THROW_NOT_OK(
           rep_levels_->Resize(new_levels_capacity * sizeof(int16_t), false));
     }
     levels_capacity_ = new_levels_capacity;
   }
+}
+
+void RecordReader::ReserveValues(int64_t capacity) {
   if (values_written_ + capacity > values_capacity_) {
     int64_t new_values_capacity = BitUtil::NextPower2(values_capacity_ + 1);
     while (values_written_ + capacity > new_values_capacity) {
@@ -662,7 +682,17 @@ void RecordReader::Reserve(int64_t capacity) {
     PARQUET_THROW_NOT_OK(values_->Resize(new_values_capacity * type_size, false));
     memset(values_->mutable_data() + values_written_ * type_size, 0,
            (new_values_capacity - values_written_) * type_size);
+
     values_capacity_ = new_values_capacity;
+  }
+  if (nullable_values_) {
+    int64_t valid_bytes_new = BitUtil::BytesForBits(values_capacity_);
+    if (valid_bits_->size() < valid_bytes_new) {
+      int64_t valid_bytes_old = BitUtil::BytesForBits(values_written_);
+      PARQUET_THROW_NOT_OK(valid_bits_->Resize(valid_bytes_new, false));
+      memset(valid_bits_->mutable_data() + valid_bytes_old, 0,
+             valid_bytes_new - valid_bytes_old);
+    }
   }
 }
 

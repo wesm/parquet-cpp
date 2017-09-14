@@ -310,7 +310,7 @@ void DoSimpleRoundtrip(const std::shared_ptr<Table>& table, int num_threads,
                        int64_t row_group_size, const std::vector<int>& column_subset,
                        std::shared_ptr<Table>* out,
                        const std::shared_ptr<ArrowWriterProperties>& arrow_properties =
-                       default_arrow_writer_properties()) {
+                           default_arrow_writer_properties()) {
   std::shared_ptr<Buffer> buffer;
   WriteTableToBuffer(table, num_threads, row_group_size, arrow_properties, &buffer);
 
@@ -1386,19 +1386,42 @@ TEST(TestArrowReadWrite, ListLargeRecords) {
   MakeListTable(num_rows, &table);
 
   std::shared_ptr<Buffer> buffer;
-  WriteTableToBuffer(table, 1, 100, default_arrow_writer_properties(),
-                     &buffer);
+  WriteTableToBuffer(table, 1, 100, default_arrow_writer_properties(), &buffer);
 
   std::unique_ptr<FileReader> reader;
   ASSERT_OK_NO_THROW(OpenFile(std::make_shared<BufferReader>(buffer),
                               ::arrow::default_memory_pool(),
-                              ::parquet::default_reader_properties(),
-                              nullptr, &reader));
+                              ::parquet::default_reader_properties(), nullptr, &reader));
 
   // Read everything
   std::shared_ptr<Table> result;
   ASSERT_OK_NO_THROW(reader->ReadTable(&result));
   AssertTablesEqual(*table, *result);
+
+  ASSERT_OK_NO_THROW(OpenFile(std::make_shared<BufferReader>(buffer),
+                              ::arrow::default_memory_pool(),
+                              ::parquet::default_reader_properties(), nullptr, &reader));
+
+  std::unique_ptr<ColumnReader> col_reader;
+  ASSERT_OK(reader->GetColumn(0, &col_reader));
+
+  auto expected = table->column(0)->data()->chunk(0);
+
+  std::vector<std::shared_ptr<Array>> pieces;
+  for (int i = 0; i < num_rows; ++i) {
+    std::shared_ptr<Array> piece;
+    ASSERT_OK(col_reader->NextBatch(1, &piece));
+    ASSERT_EQ(1, piece->length());
+    pieces.push_back(piece);
+  }
+  auto chunked = std::make_shared<::arrow::ChunkedArray>(pieces);
+
+  auto chunked_col =
+      std::make_shared<::arrow::Column>(table->schema()->field(0), chunked);
+  std::vector<std::shared_ptr<::arrow::Column>> columns = {chunked_col};
+  auto chunked_table = std::make_shared<Table>(table->schema(), columns);
+
+  ASSERT_TRUE(table->Equals(*chunked_table));
 }
 
 TEST(TestArrowWrite, CheckChunkSize) {

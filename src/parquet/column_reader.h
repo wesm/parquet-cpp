@@ -490,6 +490,11 @@ class PARQUET_EXPORT RecordReader {
 
   int64_t levels_position() const { return levels_position_; }
   int64_t levels_written() const { return levels_written_; }
+
+  // We may outwardly have the appearance of having exhausted a column chunk
+  // when in fact we are in the middle of processing the last batch
+  bool has_values_to_process() const { return levels_position_ < levels_written_; }
+
   int64_t null_count() const { return null_count_; }
 
   bool nullable_values() const { return nullable_values_; }
@@ -497,7 +502,8 @@ class PARQUET_EXPORT RecordReader {
   int64_t ReadRecords(ColumnReader* reader, int64_t num_records);
 
   void Reset();
-  void Reserve(int64_t capacity);
+  void ReserveLevels(int64_t capacity);
+  void ReserveValues(int64_t capacity);
 
   // Returns number of records scanned
   int64_t ScanRecords(ColumnReader* reader, int64_t num_records);
@@ -553,6 +559,7 @@ class PARQUET_EXPORT RecordReader {
   std::shared_ptr<::arrow::PoolBuffer> rep_levels_;
 
   void ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read, int64_t null_count);
+
   void ReadValues(ColumnReader* reader, int64_t values_to_read);
 
   // Process written repetition/definition levels to reach the end of
