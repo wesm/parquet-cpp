@@ -1452,6 +1452,7 @@ class TestNestedSchemaRead : public ::testing::TestWithParam<Repetition::type> {
 
   void InitNewParquetFile(const std::shared_ptr<GroupNode>& schema, int num_rows) {
     nested_parquet_ = std::make_shared<InMemoryOutputStream>();
+
     writer_ = parquet::ParquetFileWriter::Open(nested_parquet_, schema,
                                                default_writer_properties());
     row_group_writer_ = writer_->AppendRowGroup(num_rows);
@@ -1607,15 +1608,19 @@ class TestNestedSchemaRead : public ::testing::TestWithParam<Repetition::type> {
 
     int num_columns = num_trees * static_cast<int>((std::pow(num_children, tree_depth)));
 
-    std::vector<int16_t> def_levels(num_rows);
-    std::vector<int16_t> rep_levels(num_rows);
-    for (int i = 0; i < num_rows; i++) {
+    std::vector<int16_t> def_levels;
+    std::vector<int16_t> rep_levels;
+
+    int64_t num_levels = 0;
+    while (num_levels < num_rows) {
       if (node_repetition == Repetition::REQUIRED) {
-        def_levels[i] = 0;  // all is required
+        def_levels.push_back(0);  // all are required
       } else {
-        def_levels[i] = i % tree_depth;  // all is optional
+        int16_t level = num_levels % (tree_depth + 2);
+        def_levels.push_back(level);  // all are optional
       }
-      rep_levels[i] = 0;  // none is repeated
+      rep_levels.push_back(0);  // none is repeated
+      ++num_levels;
     }
 
     // Produce values for the columns
@@ -1767,7 +1772,7 @@ TEST_P(TestNestedSchemaRead, DeepNestedSchemaRead) {
   const int num_trees = 10;
   const int depth = 5;
   const int num_children = 3;
-  int num_rows = SMALL_SIZE * depth;
+  int num_rows = SMALL_SIZE * (depth + 2);
   CreateMultiLevelNestedParquet(num_trees, depth, num_children, num_rows, GetParam());
   std::shared_ptr<Table> table;
   ASSERT_OK_NO_THROW(reader_->ReadTable(&table));

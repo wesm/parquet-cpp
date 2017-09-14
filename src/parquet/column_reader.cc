@@ -436,12 +436,11 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
 
       levels_written_ += levels_read;
 
-      records_read += DelimitRecords(num_records - records_read,
-                                     &values_to_read);
+      records_read += DelimitRecords(num_records - records_read, &values_to_read);
       reader->ConsumeBufferedValues(levels_read);
     } else {
       // No repetition or definition levels
-      batch_size = std::min(num_records, batch_size);
+      batch_size = std::min(num_records - records_read, batch_size);
       values_to_read = batch_size;
       records_read += batch_size;
       reader->ConsumeBufferedValues(values_to_read);
@@ -456,8 +455,7 @@ int64_t RecordReader::ReadRecords(ColumnReader* reader, int64_t num_records) {
   return records_read;
 }
 
-void RecordReader::ReadValues(ColumnReader* reader,
-                              const int64_t values_to_read,
+void RecordReader::ReadValues(ColumnReader* reader, const int64_t values_to_read,
                               const int64_t start_levels_position) {
   // Conservative upper bound
   const int64_t possible_num_values =
@@ -468,12 +466,9 @@ void RecordReader::ReadValues(ColumnReader* reader,
   if (nullable_values_) {
     int64_t implied_values_read = 0;
     internal::DefinitionLevelsToBitmap(
-        def_levels() + start_levels_position,
-        levels_position_ - start_levels_position,
-        max_def_level_, max_rep_level_,
-        &implied_values_read, &null_count,
-        valid_bits_->mutable_data(),
-        values_written_);
+        def_levels() + start_levels_position, levels_position_ - start_levels_position,
+        max_def_level_, max_rep_level_, &implied_values_read, &null_count,
+        valid_bits_->mutable_data(), values_written_);
 
     ReadValuesSpaced(reader, values_to_read + null_count, null_count);
   } else {
