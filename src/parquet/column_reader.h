@@ -71,8 +71,6 @@ class PARQUET_EXPORT LevelDecoder {
   std::unique_ptr<::arrow::BitReader> bit_packed_decoder_;
 };
 
-class RecordReader;
-
 class PARQUET_EXPORT ColumnReader {
  public:
   ColumnReader(const ColumnDescriptor*, std::unique_ptr<PageReader>,
@@ -101,8 +99,6 @@ class PARQUET_EXPORT ColumnReader {
 
  protected:
   virtual bool ReadNewPage() = 0;
-
-  friend RecordReader;
 
   // Read multiple definition levels into preallocated memory
   //
@@ -273,8 +269,6 @@ class PARQUET_EXPORT TypedColumnReader : public ColumnReader {
 
  private:
   typedef Decoder<DType> DecoderType;
-
-  friend RecordReader;
 
   // Advance to the next data page
   bool ReadNewPage() override;
@@ -505,117 +499,6 @@ int64_t TypedColumnReader<DType>::Skip(int64_t num_rows_to_skip) {
   }
   return num_rows_to_skip - rows_to_skip;
 }
-
-// ----------------------------------------------------------------------
-
-/// \brief Stateful column reader that delimits semantic records for both flat
-/// and nested columns
-///
-/// \note API EXPERIMENTAL
-/// \since 1.3.0
-class PARQUET_EXPORT RecordReader {
- public:
-  RecordReader(const ColumnDescriptor* descr, ::arrow::MemoryPool* pool);
-
-  ~RecordReader() {}
-
-  int16_t* def_levels() {
-    return reinterpret_cast<int16_t*>(def_levels_->mutable_data());
-  }
-
-  int16_t* rep_levels() {
-    return reinterpret_cast<int16_t*>(rep_levels_->mutable_data());
-  }
-
-  uint8_t* values() { return values_->mutable_data(); }
-
-  /// \brief Number of values written including nulls (if any)
-  int64_t values_written() const { return values_written_; }
-
-  int64_t levels_position() const { return levels_position_; }
-  int64_t levels_written() const { return levels_written_; }
-
-  // We may outwardly have the appearance of having exhausted a column chunk
-  // when in fact we are in the middle of processing the last batch
-  bool has_values_to_process() const { return levels_position_ < levels_written_; }
-
-  int64_t null_count() const { return null_count_; }
-
-  bool nullable_values() const { return nullable_values_; }
-
-  int64_t ReadRecords(ColumnReader* reader, int64_t num_records);
-
-  void Reset();
-  void ReserveLevels(int64_t capacity);
-  void ReserveValues(int64_t capacity);
-
-  // Returns number of records scanned
-  int64_t ScanRecords(ColumnReader* reader, int64_t num_records);
-
-  std::shared_ptr<PoolBuffer> ReleaseValues() {
-    auto result = values_;
-    values_ = std::make_shared<PoolBuffer>(pool_);
-    return result;
-  }
-
-  std::shared_ptr<PoolBuffer> ReleaseIsValid() {
-    auto result = valid_bits_;
-    valid_bits_ = std::make_shared<PoolBuffer>(pool_);
-    return result;
-  }
-
-  ::arrow::ArrayBuilder* builder() { return builder_.get(); }
-
- protected:
-  const ColumnDescriptor* descr_;
-  ::arrow::MemoryPool* pool_;
-
-  const int max_def_level_;
-  const int max_rep_level_;
-
-  bool nullable_values_;
-
-  bool at_record_start_;
-  int64_t records_read_;
-
-  int64_t values_written_;
-  int64_t values_capacity_;
-  int64_t null_count_;
-
-  int64_t levels_written_;
-  int64_t levels_position_;
-  int64_t levels_capacity_;
-
-  // TODO(wesm): ByteArray / FixedLenByteArray types
-  std::unique_ptr<::arrow::ArrayBuilder> builder_;
-
-  std::shared_ptr<::arrow::PoolBuffer> values_;
-
-  void ResetValues();
-
-  template <typename T>
-  T* ValuesHead() {
-    return reinterpret_cast<T*>(values_->mutable_data()) + values_written_;
-  }
-
-  std::shared_ptr<::arrow::PoolBuffer> valid_bits_;
-  std::shared_ptr<::arrow::PoolBuffer> def_levels_;
-  std::shared_ptr<::arrow::PoolBuffer> rep_levels_;
-
-  void ReadValues(ColumnReader* reader, const int64_t values_to_read,
-                  const int64_t start_levels_position);
-
-  void ReadValuesSpaced(ColumnReader* reader, int64_t values_to_read, int64_t null_count);
-
-  void ReadValuesDense(ColumnReader* reader, int64_t values_to_read);
-
-  // Process written repetition/definition levels to reach the end of
-  // records. Process no more levels than necessary to delimit the indicated
-  // number of logical records. Updates internal state of RecordReader
-  //
-  // \return Number of records delimited
-  int64_t DelimitRecords(int64_t num_records, int64_t* values_seen);
-};
 
 // ----------------------------------------------------------------------
 // Template instantiations

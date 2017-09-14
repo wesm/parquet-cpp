@@ -87,7 +87,7 @@ class FileColumnIterator {
 
   virtual ~FileColumnIterator() {}
 
-  virtual std::shared_ptr<::parquet::ColumnReader> Next() = 0;
+  virtual std::shared_ptr<::parquet::RecordReader> Next() = 0;
 
   const SchemaDescriptor* schema() const { return schema_; }
 
@@ -108,10 +108,10 @@ class AllRowGroupsIterator : public FileColumnIterator {
   explicit AllRowGroupsIterator(int column_index, ParquetFileReader* reader)
       : FileColumnIterator(column_index, reader), next_row_group_(0) {}
 
-  std::shared_ptr<::parquet::ColumnReader> Next() override {
-    std::shared_ptr<::parquet::ColumnReader> result;
+  std::shared_ptr<::parquet::RecordReader> Next() override {
+    std::shared_ptr<::parquet::RecordReader> result;
     if (next_row_group_ < reader_->metadata()->num_row_groups()) {
-      result = reader_->RowGroup(next_row_group_)->Column(column_index_);
+      result = reader_->RowGroup(next_row_group_)->GetRecordReader(column_index_);
       next_row_group_++;
     } else {
       result = nullptr;
@@ -131,12 +131,12 @@ class SingleRowGroupIterator : public FileColumnIterator {
         row_group_number_(row_group_number),
         done_(false) {}
 
-  std::shared_ptr<::parquet::ColumnReader> Next() override {
+  std::shared_ptr<::parquet::RecordReader> Next() override {
     if (done_) {
       return nullptr;
     }
 
-    auto result = reader_->RowGroup(row_group_number_)->Column(column_index_);
+    auto result = reader_->RowGroup(row_group_number_)->GetRecordReader(column_index_);
     done_ = true;
     return result;
   };
@@ -207,8 +207,6 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
       : pool_(pool), input_(std::move(input)), descr_(input_->descr()) {
     DCHECK(NodeToField(input_->descr()->schema_node().get(), &field_).ok());
     NextRowGroup();
-
-    record_reader_.reset(new RecordReader(descr_, pool_));
   }
 
   virtual ~PrimitiveImpl() {}
@@ -230,8 +228,6 @@ class PARQUET_NO_EXPORT PrimitiveImpl : public ColumnReader::ColumnReaderImpl {
   std::unique_ptr<FileColumnIterator> input_;
   const ColumnDescriptor* descr_;
 
-  // ::parquet::ColumnReader
-  std::shared_ptr<::parquet::ColumnReader> column_reader_;
   std::shared_ptr<::parquet::RecordReader> record_reader_;
 
   std::shared_ptr<Field> field_;
@@ -802,7 +798,7 @@ struct TransferFunctor<::arrow::TimestampType, Int96Type> {
                     const std::shared_ptr<::arrow::DataType>& type,
                     std::shared_ptr<Array>* out) {
     int64_t length = reader->values_written();
-    auto values = reinterpret_cast<Int96*>(reader->values());
+    auto values = reinterpret_cast<const Int96*>(reader->values());
 
     std::shared_ptr<Buffer> data;
     RETURN_NOT_OK(::arrow::AllocateBuffer(pool, length * sizeof(int64_t), &data));
@@ -882,7 +878,7 @@ struct TransferFunctor<
   } break;
 
 Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out) {
-  if (!column_reader_) {
+  if (!record_reader_) {
     // Exhausted all row groups.
     *out = nullptr;
     return Status::OK();
@@ -896,11 +892,10 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
   try {
     record_reader_->Reset();
     while (records_to_read > 0) {
-      if (!column_reader_) {
+      if (!record_reader_) {
         break;
       }
-      int64_t records_read =
-          record_reader_->ReadRecords(column_reader_.get(), records_to_read);
+      int64_t records_read = record_reader_->ReadRecords(records_to_read);
       records_to_read -= records_read;
       if (records_read == 0) {
         NextRowGroup();
@@ -954,7 +949,7 @@ Status PrimitiveImpl::NextBatch(int records_to_read, std::shared_ptr<Array>* out
   return Status::OK();
 }
 
-void PrimitiveImpl::NextRowGroup() { column_reader_ = input_->Next(); }
+void PrimitiveImpl::NextRowGroup() { record_reader_ = input_->Next(); }
 
 Status PrimitiveImpl::GetDefLevels(const int16_t** data, size_t* length) {
   *data = record_reader_->def_levels();
