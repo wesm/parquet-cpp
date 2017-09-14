@@ -274,8 +274,9 @@ inline int64_t TypedColumnReader<DType>::ReadValuesSpaced(int64_t batch_size, T*
                                                           int64_t null_count,
                                                           uint8_t* valid_bits,
                                                           int64_t valid_bits_offset) {
-  return current_decoder_->DecodeSpaced(out, static_cast<int>(batch_size), null_count,
-                                        valid_bits, valid_bits_offset);
+  return current_decoder_->DecodeSpaced(out, static_cast<int>(batch_size),
+                                        static_cast<int>(null_count), valid_bits,
+                                        valid_bits_offset);
 }
 
 template <typename DType>
