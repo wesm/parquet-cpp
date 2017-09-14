@@ -249,9 +249,6 @@ class RecordReader::RecordReaderImpl {
 
       int type_size = GetTypeByteSize(descr_->physical_type());
       PARQUET_THROW_NOT_OK(values_->Resize(new_values_capacity * type_size, false));
-      memset(values_->mutable_data() + values_written_ * type_size, 0,
-             (new_values_capacity - values_written_) * type_size);
-
       values_capacity_ = new_values_capacity;
     }
     if (nullable_values_) {
@@ -259,6 +256,8 @@ class RecordReader::RecordReaderImpl {
       if (valid_bits_->size() < valid_bytes_new) {
         int64_t valid_bytes_old = BitUtil::BytesForBits(values_written_);
         PARQUET_THROW_NOT_OK(valid_bits_->Resize(valid_bytes_new, false));
+
+        // Avoid valgrind warnings
         memset(valid_bits_->mutable_data() + valid_bytes_old, 0,
                valid_bytes_new - valid_bytes_old);
       }
