@@ -363,6 +363,8 @@ enum CompressionCodec {
   GZIP = 2;
   LZO = 3;
   BROTLI = 4;
+  LZ4 = 5;
+  ZSTD = 6;
 }
 
 enum PageType {
@@ -637,4 +639,3 @@ struct FileMetaData {
    */
   7: optional list<ColumnOrder> column_orders;
 }
-

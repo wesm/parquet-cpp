@@ -108,7 +108,7 @@ struct Encoding {
 
 // Compression, mirrors parquet::CompressionCodec
 struct Compression {
-  enum type { UNCOMPRESSED, SNAPPY, GZIP, LZO, BROTLI };
+  enum type { UNCOMPRESSED, SNAPPY, GZIP, LZO, BROTLI, LZ4, ZSTD };
 };
 
 // parquet::PageType
