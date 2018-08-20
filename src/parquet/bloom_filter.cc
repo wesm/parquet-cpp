@@ -25,7 +25,7 @@
 #include "parquet/exception.h"
 #include "parquet/murmur3.h"
 #include "parquet/types.h"
-#include "parquet/util/logging.h"
+#include "arrow/util/logging.h"
 
 namespace parquet {
 constexpr uint32_t BlockSplitBloomFilter::SALT[kBitsSetPerBlock];

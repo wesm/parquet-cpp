@@ -40,7 +40,7 @@
 
 #include "parquet/exception.h"
 #include "parquet/parquet_types.h"
-#include "parquet/util/logging.h"
+#include "arrow/util/logging.h"
 #include "parquet/util/memory.h"
 
 namespace parquet {

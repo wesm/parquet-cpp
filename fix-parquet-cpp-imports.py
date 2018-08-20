@@ -54,7 +54,9 @@ def clean_file(path):
             need_rewrite = True
 
     if need_rewrite:
-        pass
+        with open(path, 'w') as f:
+            for line in clean_lines:
+                f.write(line)
 
 
 def _clean_imports(line):

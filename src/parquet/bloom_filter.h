@@ -23,7 +23,7 @@
 #include "parquet/exception.h"
 #include "parquet/hasher.h"
 #include "parquet/types.h"
-#include "parquet/util/logging.h"
+#include "arrow/util/logging.h"
 #include "parquet/util/memory.h"
 
 namespace parquet {

@@ -28,11 +28,41 @@
 
 #include "parquet/exception.h"
 #include "parquet/types.h"
-#include "parquet/util/logging.h"
+#include "arrow/util/compression.h"
+#include "arrow/util/logging.h"
 
 using arrow::MemoryPool;
 
 namespace parquet {
+
+std::unique_ptr<::arrow::Codec> GetCodecFromArrow(Compression::type codec) {
+  std::unique_ptr<::arrow::Codec> result;
+  switch (codec) {
+    case Compression::UNCOMPRESSED:
+      break;
+    case Compression::SNAPPY:
+      PARQUET_THROW_NOT_OK(::arrow::Codec::Create(::arrow::Compression::SNAPPY, &result));
+      break;
+    case Compression::GZIP:
+      PARQUET_THROW_NOT_OK(::arrow::Codec::Create(::arrow::Compression::GZIP, &result));
+      break;
+    case Compression::LZO:
+      PARQUET_THROW_NOT_OK(::arrow::Codec::Create(::arrow::Compression::LZO, &result));
+      break;
+    case Compression::BROTLI:
+      PARQUET_THROW_NOT_OK(::arrow::Codec::Create(::arrow::Compression::BROTLI, &result));
+      break;
+    case Compression::LZ4:
+      PARQUET_THROW_NOT_OK(::arrow::Codec::Create(::arrow::Compression::LZ4, &result));
+      break;
+    case Compression::ZSTD:
+      PARQUET_THROW_NOT_OK(::arrow::Codec::Create(::arrow::Compression::ZSTD, &result));
+      break;
+    default:
+      break;
+  }
+  return result;
+}
 
 template <class T>
 Vector<T>::Vector(int64_t size, MemoryPool* pool)

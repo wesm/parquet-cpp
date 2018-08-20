@@ -29,7 +29,7 @@
 #include "parquet/schema.h"
 #include "parquet/types.h"
 #include "parquet/util/macros.h"
-#include "parquet/util/visibility.h"
+#include "parquet/util/macros.h"
 
 namespace parquet {
 namespace schema {

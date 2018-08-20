@@ -35,6 +35,8 @@
 #include "parquet/util/memory.h"
 #include "parquet/util/test-common.h"
 
+#include "arrow/util/compression.h"
+
 namespace parquet {
 
 #define ASSERT_OK(expr)         \

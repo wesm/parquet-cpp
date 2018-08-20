@@ -31,8 +31,9 @@ function(ADD_PARQUET_TEST REL_TEST_NAME)
     message(SEND_ERROR "Error: unrecognized arguments: ${ARG_UNPARSED_ARGUMENTS}")
   endif()
 
-  ADD_ARROW_TEST({REL_TEST_NAME}
-    STATIC_LINK_LIBS parquet_static
+  ADD_ARROW_TEST(${REL_TEST_NAME}
+    STATIC_LINK_LIBS ${PARQUET_TEST_LINK_LIBS}
+    PREFIX "parquet"
     LABELS "parquet")
 endfunction()
 
@@ -55,12 +56,14 @@ else()
 endif()
 
 set(PARQUET_TEST_LINK_LIBS
-  ${ARROW_TEST_LINK_LIBS}
-  parquet_static)
+  parquet_static
+  thriftstatic
+  ${ARROW_TEST_LINK_LIBS})
 
 set(PARQUET_TEST_SHARED_LINK_LIBS
-  ${ARROW_TEST_LINK_LIBS}
-  parquet_shared)
+  parquet_shared
+  thriftstatic
+  ${ARROW_TEST_LINK_LIBS})
 
 #############################################################
 # Benchmark linking
@@ -222,10 +225,16 @@ ADD_PARQUET_TEST(types-test)
 ADD_PARQUET_TEST(reader-test)
 ADD_PARQUET_TEST(schema-test)
 
+set(PARQUET_BENCHMARK_LINK_LIBRARIES
+  arrow_benchmark_main
+  parquet_static
+  arrow_static
+  thriftstatic)
+
 ADD_ARROW_BENCHMARK(column-io-benchmark)
 ARROW_BENCHMARK_LINK_LIBRARIES(column-io-benchmark
-  parquet_static)
+  ${PARQUET_BENCHMARK_LINK_LIBRARIES})
 
 ADD_ARROW_BENCHMARK(encoding-benchmark)
 ARROW_BENCHMARK_LINK_LIBRARIES(encoding-benchmark
-  parquet_static)
+  ${PARQUET_BENCHMARK_LINK_LIBRARIES})

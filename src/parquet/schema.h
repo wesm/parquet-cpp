@@ -30,7 +30,7 @@
 
 #include "parquet/types.h"
 #include "parquet/util/macros.h"
-#include "parquet/util/visibility.h"
+#include "parquet/util/macros.h"
 
 namespace parquet {
 
@@ -180,7 +180,7 @@ class PARQUET_EXPORT Node {
   void SetParent(const Node* p_parent);
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(Node);
+  PARQUET_DISALLOW_COPY_AND_ASSIGN(Node);
 };
 
 // Save our breath all over the place with these typedefs

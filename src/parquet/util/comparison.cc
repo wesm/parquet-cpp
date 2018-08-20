@@ -63,13 +63,13 @@ std::shared_ptr<Comparator> Comparator::Make(const ColumnDescriptor* descr) {
   return nullptr;
 }
 
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<BooleanType>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<Int32Type>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<Int64Type>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<Int96Type>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<FloatType>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<DoubleType>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<ByteArrayType>;
-template class PARQUET_TEMPLATE_EXPORT CompareDefault<FLBAType>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<BooleanType>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<Int32Type>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<Int64Type>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<Int96Type>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<FloatType>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<DoubleType>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<ByteArrayType>;
+template class ARROW_TEMPLATE_EXPORT CompareDefault<FLBAType>;
 
 }  // namespace parquet

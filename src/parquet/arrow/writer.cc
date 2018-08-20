@@ -27,7 +27,7 @@
 #include "arrow/visitor_inline.h"
 
 #include "parquet/arrow/schema.h"
-#include "parquet/util/logging.h"
+#include "arrow/util/logging.h"
 
 using arrow::Array;
 using arrow::BinaryArray;
